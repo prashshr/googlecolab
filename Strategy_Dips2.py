@@ -532,6 +532,9 @@ if __name__ == "__main__":
         "xirr": r["xirr"],  # in %
     } for r in results])
 
+
+    print("\nNOTE: Prices are split- and dividend-adjusted (yfinance auto_adjust=True)\n")
+  
     print("\n======== FINAL SUMMARY (B1.2) ========\n")
     print(summary.to_string(index=False))
 
@@ -631,8 +634,6 @@ if __name__ == "__main__":
 
     # ----- Strategy text -----
     print("""
-
-NOTE: Prices are split- and dividend-adjusted (yfinance auto_adjust=True)
 
 ========= STRATEGY B1.2 DESCRIPTION (UPDATED) =========
 
