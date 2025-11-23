@@ -8,25 +8,25 @@ from datetime import datetime
 # ==========================================================
 
 # Data / universe
-START_DATE    = "2021-01-01"
+START_DATE    = "2015-01-01"
 TICKERS       = ["NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
                  "ASML", "GOOG", "META", "AVGO", "AAPL"]
 
 # Entry ladder (normal B1.2)
-DD_THRESHOLDS = [0.10, 0.15, 0.20]          # 15%, 20%, 25% from ATH
+DD_THRESHOLDS = [0.10, 0.15, 0.20]          # 10%, 15%, 20% drawdown from ATH
 TP_LEVELS     = [1.20, 1.40, 1.60]          # 1.2x, 1.4x, 1.6x ATH TP levels
 TP_FRACS      = [0.15, 0.15, 0.15]          # 15% of normal shares at each TP
 
 # Normal buys
 BUY_AMOUNTS   = {                            # base size per ladder level
-    0: 250.0,   # for 1st threshold
-    1: 250.0,   # for 2nd threshold
-    2: 250.0,   # for 3rd threshold
+    0: 100.0,   # for 1st threshold
+    1: 100.0,   # for 2nd threshold
+    2: 100.0,   # for 3rd threshold
 }
 MAX_NORMAL_CAP = 3000.0                      # cap for normal buys only
 
 # Heavy low-marker buy
-HEAVY_BUY_BASE          = 1000.0             # 1000 USD + accumulated pool
+HEAVY_BUY_BASE          = 500.0              # base amount for heavy buy
 LOW_MARKER_LOOKBACK     = 60                 # days for vol / logTR avg
 LOW_MARKER_DD_MIN       = 0.30               # ≥ 30% below ATH
 LOW_MARKER_EMA_MULT     = 0.85               # price ≤ EMA200 * 0.85
@@ -174,17 +174,25 @@ def compute_rsi(close, period=RSI_PERIOD):
 def detect_bottoms_b1(close, thresholds):
     """
     thresholds = list of drawdown percentages from ATH
-    Returns list of (date, price, ath_pre_correction, threshold_index)
+    Returns list of:
+        (signal_date, signal_price, ath_pre_correction, threshold_index, ath_date)
+
+    ATH patch:
+      - ath_date is the date when that ATH was last set.
+      - This lets us print only the **last ATH** before each dip that triggers a BUY.
     """
     ath = -np.inf
+    ath_date = None
     hit = {}
     signals = []
 
     for date, price in close.items():
         price = float(price)
 
+        # New ATH (update level and date, reset threshold hits)
         if price > ath:
             ath = price
+            ath_date = date
             hit = {thr: False for thr in thresholds}
             continue
 
@@ -194,8 +202,9 @@ def detect_bottoms_b1(close, thresholds):
         dd = (ath - price) / ath
 
         for i, thr in enumerate(thresholds):
-            if not hit[thr] and dd >= thr:
-                signals.append((date, price, ath, i))
+            if not hit.get(thr, False) and dd >= thr:
+                # include ath_date in the tuple
+                signals.append((date, price, ath, i, ath_date))
                 hit[thr] = True
 
     return signals
@@ -416,12 +425,12 @@ def run_strategy_b1_2(ticker, start=START_DATE):
     marker_dates = low_marker[low_marker].index
     marker_count = int(low_marker.sum())
 
-    # Ladder signals
+    # Ladder signals (now include ath_date)
     signals = detect_bottoms_b1(close, DD_THRESHOLDS)
     p = Portfolio()
 
     # Normal ladder logic
-    for date, price, ath_pre, thr_idx in signals:
+    for date, price, ath_pre, thr_idx, ath_date in signals:
         if pd.isna(ema200.loc[date]) or price < ema200.loc[date]:
             continue
 
@@ -451,24 +460,45 @@ def run_strategy_b1_2(ticker, start=START_DATE):
         price = close.loc[d]
         p.heavy_buy(d, price, HEAVY_BUY_BASE, reason="HEAVY_BUY_LOW_MARKER")
 
-    # ATH events timeline
+    # ========= ATH EVENTS (PATCHED & THINNED) =========
+    # Step 1: only keep the last ATH associated with each correction (from signals)
+    unique_ath_dates = sorted({ath_date for *_, ath_date in signals})
+
+    # Step 2: further thin:
+    #   - at most ONE ATH per calendar month
+    #   - and at least 30 days between printed ATH events
     ath_events = []
-    ath = -np.inf
-    for date, price in close.items():
-        price = float(price)
-        if price > ath:
-            ath = price
-            ath_events.append({
-                "type": "ATH_EVENT",
-                "date": pd.Timestamp(date).to_pydatetime().replace(tzinfo=None),
-                "price": price,
-                "amount": 0.0,
-                "shares": 0.0,
-                "shares_sold": 0.0,
-                "realized": 0.0,
-                "profit": 0.0,
-                "reason": "NEW_ATH",
-            })
+    last_kept_date = None
+    last_kept_month = None  # (year, month)
+
+    for ath_date in unique_ath_dates:
+        ts = pd.Timestamp(ath_date)
+        ym = (ts.year, ts.month)
+
+        if last_kept_date is None:
+            include = True
+        else:
+            days_diff = (ts - last_kept_date).days
+            include = (ym != last_kept_month) and (days_diff >= 30)
+
+        if not include:
+            continue
+
+        last_kept_date = ts
+        last_kept_month = ym
+
+        ath_price = float(close.loc[ts])
+        ath_events.append({
+            "type": "ATH_EVENT",
+            "date": ts.to_pydatetime().replace(tzinfo=None),
+            "price": ath_price,
+            "amount": 0.0,
+            "shares": 0.0,
+            "shares_sold": 0.0,
+            "realized": 0.0,
+            "profit": 0.0,
+            "reason": "NEW_ATH",
+        })
 
     # Final valuation + XIRR
     last_price = float(close.iloc[-1])
@@ -532,9 +562,8 @@ if __name__ == "__main__":
         "xirr": r["xirr"],  # in %
     } for r in results])
 
-
     print("\nNOTE: Prices are split- and dividend-adjusted (yfinance auto_adjust=True)\n")
-  
+
     print("\n======== FINAL SUMMARY (B1.2) ========\n")
     print(summary.to_string(index=False))
 
@@ -639,13 +668,11 @@ if __name__ == "__main__":
 
 ENTRY LOGIC (B1.2):
   1) Track all-time-high (ATH) for each ticker.
-  2) When price drops 15% below ATH: first BUY.
-  3) When price drops 20% below ATH: second BUY.
-  4) When price drops 25% below ATH: third BUY.
-  5) Buy sizes for these ladders are configured via BUY_AMOUNTS.
-  6) Only buy if price > 200-day EMA (trend filter, no catching falling knives).
-  7) Hard cap: max invested per ticker = MAX_NORMAL_CAP (normal buys only).
-  8) Realized profit from normal SELLs is accumulated in a low-marker pool
+  2) When price drops according to DD_THRESHOLDS (e.g. 10/15/20% below ATH):
+       trigger ladder BUYs with BUY_AMOUNTS.
+  3) Only buy if price > EMA(EMA_WINDOW) (trend filter, no catching falling knives).
+  4) Hard cap: max invested per ticker in normal buys = MAX_NORMAL_CAP.
+  5) Realized profit from normal SELLs is accumulated in a low-marker pool
      and only deployed into heavy low-marker buys.
 
 LOW-MARKER HEAVY BUY:
@@ -660,9 +687,17 @@ LOW-MARKER HEAVY BUY:
       * Execute a heavy BUY of (HEAVY_BUY_BASE + accumulated low-marker pool).
       * Heavy-buy cycles are never sold and do not affect the normal cap.
 
+ATH EVENTS (PATCHED & THINNED):
+  - For each correction that triggers at least one ladder BUY,
+    we first keep only the last ATH before that dip.
+  - Then we further restrict printing to:
+      * at most ONE ATH per calendar month, AND
+      * at least 30 days between printed ATH events.
+  - This removes noisy daily ATH rows and keeps only key regime-defining highs.
+
 EXIT / PROFIT-TAKING:
-  - For each normal BUY, define take-profit levels at:
-      * TP_LEVELS (e.g. 1.20, 1.40, 1.60 × ATH before correction)
+  - For each normal BUY, define take-profit levels at TP_LEVELS
+    (e.g. 1.20, 1.40, 1.60 × ATH before correction).
   - At each target hit, sell TP_FRACS (e.g. 15%) of total normal shares.
   - Remaining normal shares plus all heavy-buy shares are held until the end.
   - Realized profit from normal sells feeds into the low-marker pool.
