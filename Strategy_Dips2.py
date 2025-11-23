@@ -631,6 +631,9 @@ if __name__ == "__main__":
 
     # ----- Strategy text -----
     print("""
+
+NOTE: Prices are split- and dividend-adjusted (yfinance auto_adjust=True)
+
 ========= STRATEGY B1.2 DESCRIPTION (UPDATED) =========
 
 ENTRY LOGIC (B1.2):
