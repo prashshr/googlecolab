@@ -7,85 +7,70 @@ from datetime import datetime
 # 0. USER-CONFIGURABLE PARAMETERS
 # ==========================================================
 
-START_DATE = "2022-01-01"
+# Data / universe
+DATA_START = "2021-01-01"
 TICKERS = ["NVDA", "MSFT", "PLTR", "TSLA", "AMZN", "ASML", "CRWD", "META", "AVGO", "NOW"]
 
-# Signal thresholds (drawdown levels from ATH, e.g. 0.15 = 15%)
-ATH_DD_THRESHOLDS = [0.15, 0.20, 0.25]
+# Enable ANSI colors in console output
+ENABLE_COLORS = True
 
-# Take-profit levels (multiples of ATH before correction)
-TP_LEVELS = [1.20, 1.40, 1.60]
+# Ladder (normal B1.2) drawdown thresholds from ATH
+LADDER_THRESHOLDS = [0.15, 0.20, 0.25]      # 15%, 20%, 25%
 
-# Take-profit fractions (portion of normal shares sold at each TP)
-TP_FRACTIONS = [0.15, 0.15, 0.15]
+# Normal buy sizes per ladder step (before any special logic)
+FIRST_BUY_AMOUNT = 250.0
+SECOND_BUY_AMOUNT = 250.0
+THIRD_BUY_AMOUNT = 250.0
 
-# Normal buy sizing (per ladder level)
-BUY_AMOUNT_1 = 250.0  # e.g. for 1st rung (smallest DD)
-BUY_AMOUNT_2 = 250.0  # e.g. for 2nd rung
-BUY_AMOUNT_3 = 250.0  # e.g. for 3rd rung (deepest DD)
+# Take-profit levels and fractions (for normal buys)
+TP_LEVELS = [1.20, 1.40, 1.60]              # x ATH
+TP_FRACTIONS = [0.15, 0.15, 0.15]           # 15% each TP (of normal shares)
 
-# Max normal capital per ticker (does NOT include heavy buys cap)
-MAX_NORMAL_CAP = 3000.0
+# Trend filter
+EMA_PERIOD = 200
 
-# Heavy low-marker buy base amount
+# Hard capital cap for normal buys (per ticker)
+MAX_CAP_NORMAL = 3000.0
+
+# Heavy low-marker buy base size (per marker), before profit pool
 HEAVY_BASE_AMOUNT = 1000.0
 
-# Trend + RSI settings
-EMA_LENGTH = 200
+# Low-marker (capitulation) conditions (relaxed version)
+LOWMARKER_DD_MIN = 0.30           # Drawdown_from_ATH ≥ 30%
+LOWMARKER_EMA_MULT = 0.85         # Price ≤ 200d_EMA * 0.85
+VOL_LOOKBACK = 60
+VOL_MULT = 1.3                    # Volume_today ≥ 1.3 × Vol_60d_avg
+LOGTR_LOOKBACK = 60
+LOGTR_MULT = 1.3                  # logATR_today ≥ 1.3 × logATR_60d_avg
+CLV_MIN = 0.40                    # (Close - Low)/(High - Low) ≥ 0.40
 RSI_PERIOD = 14
-
-# Low-marker condition parameters
-LOW_MARKER_LOOKBACK = 60
-LOW_MARKER_DD_MIN = 0.30         # 30% drawdown from ATH
-LOW_MARKER_EMA_MULT = 0.85       # Price <= EMA * 0.85
-LOW_MARKER_VOL_MULT = 1.3        # Volume >= 1.3 * 60d avg
-LOW_MARKER_LOGATR_MULT = 1.3     # logATR >= 1.3 * 60d avg
-LOW_MARKER_CLV_MIN = 0.40        # (Close-Low)/(High-Low) >= 0.40
-LOW_MARKER_RSI_MAX = 40.0        # RSI(14) <= 40
+RSI_MAX = 40.0                    # RSI(14) ≤ 40
 
 # XIRR solver bounds
-XIRR_MAX_RATE = 5.0
-
-# Terminal color toggle
-ENABLE_COLORS = True  # Set False if your terminal does not support ANSI colors
-
+XIRR_LOW = -0.999
+XIRR_HIGH = 5.0
 
 # ==========================================================
-# ANSI COLOR CODES (for terminal output only)
+# ANSI COLORS (controlled by ENABLE_COLORS)
 # ==========================================================
 
 if ENABLE_COLORS:
-    COLOR_YELLOW = "\033[33m"
-    COLOR_GREEN = "\033[32m"
-    COLOR_RED = "\033[31m"
     COLOR_RESET = "\033[0m"
+    COLOR_ATH = "\033[33m"   # Yellow
+    COLOR_BUY = "\033[32m"   # Green
+    COLOR_SELL = "\033[31m"  # Red
 else:
-    COLOR_YELLOW = ""
-    COLOR_GREEN = ""
-    COLOR_RED = ""
     COLOR_RESET = ""
-
-
-def colorize_row(row_str, event_type):
-    """Wrap a whole row string in a color based on event_type."""
-    if not ENABLE_COLORS:
-        return row_str
-
-    if event_type == "ATH_EVENT":
-        return f"{COLOR_YELLOW}{row_str}{COLOR_RESET}"
-    elif event_type in ("BUY", "HEAVY_BUY"):
-        return f"{COLOR_GREEN}{row_str}{COLOR_RESET}"
-    elif event_type == "SELL":
-        return f"{COLOR_RED}{row_str}{COLOR_RESET}"
-    else:
-        return row_str
+    COLOR_ATH = ""
+    COLOR_BUY = ""
+    COLOR_SELL = ""
 
 
 # ==========================================================
 # 1. Robust loader for Close prices (split-adjusted, tz-naive)
 # ==========================================================
 
-def load_close(ticker, start=START_DATE):
+def load_close(ticker, start=DATA_START):
     df = yf.download(
         ticker,
         start=start,
@@ -94,6 +79,7 @@ def load_close(ticker, start=START_DATE):
         group_by="column"
     )
 
+    # Flatten possible MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(-1)
 
@@ -119,7 +105,7 @@ def load_close(ticker, start=START_DATE):
 # 1b. OHLCV loader for technicals (auto_adjusted, tz-naive)
 # ==========================================================
 
-def load_ohlcv(ticker, start=START_DATE):
+def load_ohlcv(ticker, start=DATA_START):
     needed = ["Open", "High", "Low", "Close", "Volume"]
 
     df = yf.download(
@@ -205,7 +191,7 @@ def detect_bottoms_b1(close, thresholds):
 
 
 # ==========================================================
-# 3. Portfolio engine with events (normal + heavy cycles)
+# 3. Portfolio engine (low-marker profit pool, heavy buys)
 # ==========================================================
 
 class Cycle:
@@ -218,37 +204,20 @@ class Cycle:
 class Portfolio:
     def __init__(self):
         self.cycles = []
-        self.trade_log = []   # full trade log (for CSV)
-        self.events = []      # simplified 9-column event log for printing
+        self.trade_log = []
         self.profit_booked = 0.0
         self.invested = 0.0
-        self.low_marker_pool = 0.0  # profit bucket for heavy buys
 
-    def log_event(self, event_type, date, price=None,
-                  amount=None, shares=None, shares_sold=None,
-                  realized=None, profit=None, reason=""):
-        """
-        Stores a single event row with the 9-column schema:
-        type, date, price, amount, shares, shares_sold, realized, profit, reason
-        """
-        self.events.append({
-            "type": event_type,
-            "date": pd.Timestamp(date).to_pydatetime().replace(tzinfo=None),
-            "price": float(price) if price is not None else None,
-            "amount": float(amount) if amount is not None else None,
-            "shares": float(shares) if shares is not None else None,
-            "shares_sold": float(shares_sold) if shares_sold is not None else None,
-            "realized": float(realized) if realized is not None else None,
-            "profit": float(profit) if profit is not None else None,
-            "reason": reason,
-        })
+        # profits from normal sells accumulate here
+        # and are deployed only at the next low-marker heavy buy.
+        self.low_marker_pool = 0.0
 
-    def buy(self, date, price, base_amount, max_cap, dd_level=None):
+    def buy(self, date, price, base_amount, max_cap):
         """
         Normal buy:
-        - Uses ONLY base_amount (250, 500, 750).
+        - Uses ONLY base_amount (e.g. 250).
         - Does NOT use the low_marker_pool.
-        - Respects max_cap (normal cap).
+        - Respects max_cap for normal buys.
         """
         amount = base_amount
 
@@ -262,11 +231,6 @@ class Portfolio:
         self.cycles.append(Cycle(price, shares, is_heavy=False))
         self.invested += amount
 
-        reason = "NORMAL_BUY"
-        if dd_level is not None:
-            reason = f"NORMAL_BUY_DD_{int(dd_level*100)}%"
-
-        # trade log (for CSV)
         self.trade_log.append({
             "type": "BUY",
             "date": pd.Timestamp(date).to_pydatetime().replace(tzinfo=None),
@@ -276,28 +240,18 @@ class Portfolio:
             "shares_sold": None,
             "realized": None,
             "profit": None,
-            "reason": reason,
+            "is_heavy": False,
         })
-
-        # event log (for printing)
-        self.log_event(
-            event_type="BUY",
-            date=date,
-            price=price,
-            amount=amount,
-            shares=shares,
-            reason=reason
-        )
 
     def heavy_buy(self, date, price, base_amount):
         """
         Heavy capitulation buy:
-        - Amount = base_amount + accumulated low_marker_pool.
-        - Never sold (is_heavy=True).
-        - Counts toward 'invested'.
+        - Amount = base_amount (e.g. 1000 USD) + accumulated low_marker_pool.
+        - Heavy-buy cycles are never sold (is_heavy=True).
+        - Counts toward 'invested' for reporting.
         """
         amount = base_amount + self.low_marker_pool
-        self.low_marker_pool = 0.0
+        self.low_marker_pool = 0.0  # reset pool after deployment
 
         if amount <= 0:
             return
@@ -306,9 +260,6 @@ class Portfolio:
         self.cycles.append(Cycle(price, shares, is_heavy=True))
         self.invested += amount
 
-        reason = "HEAVY_BUY_LOW_MARKER"
-
-        # trade log
         self.trade_log.append({
             "type": "HEAVY_BUY",
             "date": pd.Timestamp(date).to_pydatetime().replace(tzinfo=None),
@@ -318,24 +269,15 @@ class Portfolio:
             "shares_sold": None,
             "realized": None,
             "profit": None,
-            "reason": reason,
+            "is_heavy": True,
         })
 
-        # event log
-        self.log_event(
-            event_type="HEAVY_BUY",
-            date=date,
-            price=price,
-            amount=amount,
-            shares=shares,
-            reason=reason
-        )
-
-    def sell_fraction(self, date, price, fraction, tp_label="TP"):
+    def sell_fraction(self, date, price, fraction):
         """
         Sells 'fraction' of TOTAL *normal* shares (is_heavy=False),
         pro-rata across normal cycles.
-        Heavy cycles are never sold.
+
+        Heavy-buy cycles (is_heavy=True) are NEVER sold.
         Realized profit from these sells goes into low_marker_pool.
         """
         total_shares = sum(c.shares for c in self.cycles if not c.is_heavy)
@@ -349,7 +291,7 @@ class Portfolio:
 
         for c in self.cycles:
             if c.is_heavy:
-                continue
+                continue  # do not touch heavy cycles
 
             if remaining <= 0 or c.shares <= 0:
                 continue
@@ -365,12 +307,10 @@ class Portfolio:
             realized_total += realized
             profit_total += profit
 
+        # profit from normal sells is booked and saved for next low-marker heavy buy
         self.low_marker_pool += profit_total
         self.profit_booked += profit_total
 
-        reason = f"SELL_{tp_label}"
-
-        # trade log
         self.trade_log.append({
             "type": "SELL",
             "date": pd.Timestamp(date).to_pydatetime().replace(tzinfo=None),
@@ -380,24 +320,15 @@ class Portfolio:
             "shares_sold": float(target - remaining),
             "realized": float(realized_total),
             "profit": float(profit_total),
-            "reason": reason,
+            "is_heavy": False,
         })
 
-        # event log
-        self.log_event(
-            event_type="SELL",
-            date=date,
-            price=price,
-            shares_sold=(target - remaining),
-            realized=realized_total,
-            profit=profit_total,
-            reason=reason
-        )
-
+        # remove empty cycles
         self.cycles = [c for c in self.cycles if c.shares > 1e-12]
         return realized_total
 
     def current_value(self, price):
+        # heavy + normal cycles; all are part of portfolio value
         return sum(c.shares * price for c in self.cycles)
 
 
@@ -424,7 +355,7 @@ def compute_xirr(cashflows):
             s += amt / ((1 + rate) ** years)
         return s
 
-    low, high = -0.999, XIRR_MAX_RATE
+    low, high = XIRR_LOW, XIRR_HIGH
     npv_low = npv(low)
     npv_high = npv(high)
 
@@ -446,21 +377,116 @@ def compute_xirr(cashflows):
 
 
 # ==========================================================
-# 5. Strategy runner (with log-ATR marker + events)
+# Helper: build chronological event log (ATH + trades)
 # ==========================================================
 
-def run_strategy_b1_2(ticker, start=START_DATE):
+def build_event_log(close, trade_log):
+    """
+    Build a chronological event log:
+    - ATH_EVENT (yellow)
+    - BUY (green)
+    - HEAVY_BUY (green)
+    - SELL (red)
+
+    Returns list of dicts with the 9 columns:
+      date, event, price, amount, shares, shares_sold,
+      total_shares_after, cum_invested, cum_profit_booked
+    """
+    # 1) ATH events
+    ath_events = []
+    ath = -np.inf
+    for date, price in close.items():
+        price = float(price)
+        if price > ath:
+            ath = price
+            ath_events.append({
+                "date": pd.Timestamp(date).to_pydatetime().replace(tzinfo=None),
+                "event": "ATH_EVENT",
+                "price": price,
+                "amount": np.nan,
+                "shares": np.nan,
+                "shares_sold": np.nan,
+                "profit": 0.0,
+            })
+
+    # 2) Trade events
+    trade_events = []
+    for log in trade_log:
+        e = {
+            "date": log["date"],
+            "event": log["type"],  # BUY / HEAVY_BUY / SELL
+            "price": log["price"],
+            "amount": log["amount"] if log["amount"] is not None else np.nan,
+            "shares": log["shares"] if log["shares"] is not None else np.nan,
+            "shares_sold": log["shares_sold"] if log["shares_sold"] is not None else np.nan,
+            "profit": log["profit"] if log["profit"] is not None else 0.0,
+        }
+        trade_events.append(e)
+
+    # 3) Combine and sort chronologically
+    all_events = ath_events + trade_events
+    all_events.sort(key=lambda e: (e["date"], 0 if e["event"] == "ATH_EVENT" else 1))
+
+    # 4) Walk through and build cumulative state
+    events_out = []
+    cum_shares = 0.0
+    cum_invested = 0.0
+    cum_profit = 0.0
+
+    for e in all_events:
+        ev = e["event"]
+
+        if ev in ("BUY", "HEAVY_BUY"):
+            if not np.isnan(e["shares"]):
+                cum_shares += e["shares"]
+            if not np.isnan(e["amount"]):
+                cum_invested += e["amount"]
+
+        elif ev == "SELL":
+            if not np.isnan(e["shares_sold"]):
+                cum_shares -= e["shares_sold"]
+            cum_profit += e["profit"]
+
+        # ATH_EVENT: no state change
+
+        events_out.append({
+            "date": e["date"],
+            "event": ev,
+            "price": e["price"],
+            "amount": e["amount"],
+            "shares": e["shares"],
+            "shares_sold": e["shares_sold"],
+            "total_shares_after": cum_shares,
+            "cum_invested": cum_invested,
+            "cum_profit_booked": cum_profit,
+        })
+
+    return events_out
+
+
+# ==========================================================
+# 5. Strategy runner (with log-ATR marker + relaxed thresholds)
+# ==========================================================
+
+def run_strategy_b1_2(ticker, start=DATA_START):
+    # Base price series
     close = load_close(ticker, start)
-    ohlcv = load_ohlcv(ticker, start).reindex(close.index)
+
+    # OHLCV for technicals (aligned to close index)
+    ohlcv = load_ohlcv(ticker, start)
+    ohlcv = ohlcv.reindex(close.index)
 
     high = ohlcv["High"]
     low = ohlcv["Low"]
     volume = ohlcv["Volume"]
 
-    ema200 = close.rolling(EMA_LENGTH).mean()
+    # 200-day EMA (currently SMA via rolling mean)
+    ema200 = close.rolling(EMA_PERIOD).mean()
+
+    # RSI
     rsi14 = compute_rsi(close, period=RSI_PERIOD)
 
-    # Log-based True Range and 60-day averages
+    # -------- Upgrade D: log-based True Range & ATR-style measure --------
     log_close = np.log(close)
     log_high = np.log(high)
     log_low = np.log(low)
@@ -471,87 +497,74 @@ def run_strategy_b1_2(ticker, start=START_DATE):
     lr3 = (log_low - log_prev_close).abs()
     log_tr = pd.concat([lr1, lr2, lr3], axis=1).max(axis=1)
 
-    vol_60 = volume.rolling(LOW_MARKER_LOOKBACK).mean()
-    log_tr_60 = log_tr.rolling(LOW_MARKER_LOOKBACK).mean()
+    vol_60 = volume.rolling(VOL_LOOKBACK).mean()
+    log_tr_60 = log_tr.rolling(LOGTR_LOOKBACK).mean()
 
     # Drawdown from ATH
     ath_series = close.cummax()
     drawdown = (ath_series - close) / ath_series
 
-    # Close-location value
+    # Intraday close-location value (CLV)
     day_range = (high - low).replace(0, np.nan)
-    clv = (close - low) / day_range
+    clv = (close - low) / day_range  # can be NaN when no range
 
-    # Low marker conditions
-    condA = drawdown >= LOW_MARKER_DD_MIN
-    condB = close <= ema200 * LOW_MARKER_EMA_MULT
-    condC = volume >= LOW_MARKER_VOL_MULT * vol_60
-    condD = log_tr >= LOW_MARKER_LOGATR_MULT * log_tr_60
-    condE = clv >= LOW_MARKER_CLV_MIN
-    condF = rsi14 <= LOW_MARKER_RSI_MAX
+    # -------- RELAXED LOW-MARKER CONDITIONS --------
+    condA = drawdown >= LOWMARKER_DD_MIN
+    condB = close <= ema200 * LOWMARKER_EMA_MULT
+    condC = volume >= VOL_MULT * vol_60
+    condD = log_tr >= LOGTR_MULT * log_tr_60
+    condE = clv >= CLV_MIN
+    condF = rsi14 <= RSI_MAX
 
     low_marker = condA & condB & condC & condD & condE & condF
     marker_dates = low_marker[low_marker].index
     marker_count = int(low_marker.sum())
 
-    thresholds = ATH_DD_THRESHOLDS
+    # -------- Normal B1.2 ladder logic --------
+    thresholds = LADDER_THRESHOLDS
     tp_levels = TP_LEVELS
     tp_fracs = TP_FRACTIONS
 
     signals = detect_bottoms_b1(close, thresholds)
     p = Portfolio()
 
-    # Track ATH events for printing
-    ath = -np.inf
-    for date, price in close.items():
-        price = float(price)
-        if price > ath:
-            ath = price
-            # Log ATH event
-            p.log_event(
-                event_type="ATH_EVENT",
-                date=date,
-                price=price,
-                reason="NEW_ATH"
-            )
-
-    # Normal ladder logic
     for date, price, ath_pre in signals:
+        # Trend filter
         if pd.isna(ema200.loc[date]) or price < ema200.loc[date]:
             continue
 
+        # Buy size selection based on DD
         dd = (ath_pre - price) / ath_pre
         if dd >= thresholds[2]:
-            base_amt = BUY_AMOUNT_3
-            dd_level = thresholds[2]
+            base_amt = THIRD_BUY_AMOUNT
         elif dd >= thresholds[1]:
-            base_amt = BUY_AMOUNT_2
-            dd_level = thresholds[1]
+            base_amt = SECOND_BUY_AMOUNT
         else:
-            base_amt = BUY_AMOUNT_1
-            dd_level = thresholds[0]
+            base_amt = FIRST_BUY_AMOUNT
 
-        p.buy(date, price, base_amt, MAX_NORMAL_CAP, dd_level=dd_level)
+        # Normal ladder buy (uses only base_amt, not pool)
+        p.buy(date, price, base_amt, MAX_CAP_NORMAL)
 
+        # Take-profits based on ATH * multiples
         future = close[close.index > date]
 
-        for i, (tp_mult, frac) in enumerate(zip(tp_levels, tp_fracs), start=1):
+        for tp_mult, frac in zip(tp_levels, tp_fracs):
             target = ath_pre * tp_mult
             hit = future[future >= target]
             if hit.empty:
                 break
-
             hit_date = hit.index[0]
             hit_price = hit.iloc[0]
-            p.sell_fraction(hit_date, hit_price, frac, tp_label=f"TP{i}")
 
+            p.sell_fraction(hit_date, hit_price, frac)
             future = future[future.index > hit_date]
 
-    # Heavy low-marker buys
+    # -------- Heavy low-marker buys --------
     for d in marker_dates:
         price = close.loc[d]
         p.heavy_buy(d, price, HEAVY_BASE_AMOUNT)
 
+    # -------- Final valuation + XIRR --------
     last_price = float(close.iloc[-1])
     last_date = close.index[-1]
 
@@ -559,7 +572,7 @@ def run_strategy_b1_2(ticker, start=START_DATE):
     final_value = held_value + p.profit_booked
     total_pnl = final_value - p.invested
 
-    # Per-ticker cashflows
+    # Per-ticker cashflows (for per-ticker XIRR)
     cashflows = []
     for log in p.trade_log:
         if log["type"] in ("BUY", "HEAVY_BUY"):
@@ -574,6 +587,9 @@ def run_strategy_b1_2(ticker, start=START_DATE):
     xirr_decimal = compute_xirr(cashflows)
     xirr_pct = xirr_decimal * 100.0 if pd.notna(xirr_decimal) else np.nan
 
+    # -------- Build chronological event log (ATH + trades) --------
+    events = build_event_log(close, p.trade_log)
+
     return {
         "ticker": ticker,
         "num_signals": len(signals),
@@ -582,78 +598,93 @@ def run_strategy_b1_2(ticker, start=START_DATE):
         "held_value": held_value,
         "final_value": final_value,
         "total_pnl": total_pnl,
-        "xirr": xirr_pct,
+        "xirr": xirr_pct,      # percentage
         "trade_log": p.trade_log,
-        "events": p.events,
         "marker_count": marker_count,
         "last_date": pd.Timestamp(last_date).to_pydatetime().replace(tzinfo=None),
+        "events": events,
     }
 
 
 # ==========================================================
-# 6. Pretty-print event table per ticker
+# Helper: pretty-print event tables with colors
 # ==========================================================
 
-EVENT_COLUMNS = [
-    "type",
-    "date",
-    "price",
-    "amount",
-    "shares",
-    "shares_sold",
-    "realized",
-    "profit",
-    "reason",
-]
+def fmt_float(x, width, decimals=2):
+    if pd.isna(x):
+        return " " * width
+    fmt = f"{{:>{width}.{decimals}f}}"
+    return fmt.format(x)
 
-
-def format_value(col, val):
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return ""
-    if col == "date":
-        if isinstance(val, (datetime, pd.Timestamp)):
-            return val.strftime("%Y-%m-%d %H:%M:%S")
-        return str(val)
-    if col in ("price", "amount", "shares", "shares_sold", "realized", "profit"):
-        return f"{val:,.2f}"
-    return str(val)
-
-
-def print_events_table(ticker, events):
+def print_events_for_ticker(ticker, events):
     if not events:
-        print(f"\n--- {ticker} : NO EVENTS ---")
+        print(f"\n===== EVENTS FOR {ticker} =====")
+        print("(no events)")
         return
 
-    # Compute column widths
-    widths = {col: len(col) for col in EVENT_COLUMNS}
-    formatted_rows = []
+    print(f"\n===== EVENTS FOR {ticker} =====\n")
 
-    for e in events:
-        row = {}
-        for col in EVENT_COLUMNS:
-            row[col] = format_value(col, e.get(col))
-            widths[col] = max(widths[col], len(row[col]))
-        formatted_rows.append((e["type"], row))
-
-    # Header
-    print(f"\n--- EVENTS FOR {ticker} ---")
-    header = " | ".join(col.ljust(widths[col]) for col in EVENT_COLUMNS)
+    # 9 columns: date, event, price, amount, shares, shares_sold,
+    #            total_shares_after, cum_invested, cum_profit_booked
+    header = (
+        f"{'date':<19} "
+        f"{'event':<10} "
+        f"{'price':>10} "
+        f"{'amount':>10} "
+        f"{'shares':>10} "
+        f"{'sold':>10} "
+        f"{'tot_shares':>12} "
+        f"{'cum_invest':>12} "
+        f"{'cum_profit':>12}"
+    )
     print(header)
     print("-" * len(header))
 
-    # Rows
-    for event_type, row in formatted_rows:
-        row_str = " | ".join(row[col].ljust(widths[col]) for col in EVENT_COLUMNS)
-        print(colorize_row(row_str, event_type))
+    for e in events:
+        d = e["date"].strftime("%Y-%m-%d")
+        ev = e["event"]
+        price = fmt_float(e["price"], 10, 2)
+        amount = fmt_float(e["amount"], 10, 2)
+        shares = fmt_float(e["shares"], 10, 4)
+        sold = fmt_float(e["shares_sold"], 10, 4)
+        tot_shares = fmt_float(e["total_shares_after"], 12, 4)
+        cum_inv = fmt_float(e["cum_invested"], 12, 2)
+        cum_profit = fmt_float(e["cum_profit_booked"], 12, 2)
+
+        line = (
+            f"{d:<19} "
+            f"{ev:<10} "
+            f"{price} "
+            f"{amount} "
+            f"{shares} "
+            f"{sold} "
+            f"{tot_shares} "
+            f"{cum_inv} "
+            f"{cum_profit}"
+        )
+
+        # Color by event type
+        if ev == "ATH_EVENT":
+            color = COLOR_ATH
+        elif ev in ("BUY", "HEAVY_BUY"):
+            color = COLOR_BUY
+        elif ev == "SELL":
+            color = COLOR_SELL
+        else:
+            color = ""
+
+        if ENABLE_COLORS and color:
+            print(color + line + COLOR_RESET)
+        else:
+            print(line)
 
 
 # ==========================================================
-# 7. Run for all tickers + exports + portfolio stats
+# 6. Run for all tickers + exports + portfolio stats
 # ==========================================================
 
 if __name__ == "__main__":
     print("Running B1.2 backtest...\n")
-
     results = []
     for t in TICKERS:
         print(f"Processing {t} ...")
@@ -668,13 +699,13 @@ if __name__ == "__main__":
         "held_value": r["held_value"],
         "final_value": r["final_value"],
         "total_pnl": r["total_pnl"],
-        "xirr_pct": r["xirr"],  # already in %
+        "xirr_%": r["xirr"],  # percentage
     } for r in results])
 
     print("\n======== FINAL SUMMARY (B1.2) ========\n")
     print(summary.to_string(index=False))
 
-    # Low marker counts
+    # ----- LOW-MARKER COUNTS -----
     marker_counts = pd.DataFrame([{
         "ticker": r["ticker"],
         "low_marker_triggers": r["marker_count"],
@@ -683,40 +714,26 @@ if __name__ == "__main__":
     print("\n====== LOW MARKER COUNTS ======\n")
     print(marker_counts.to_string(index=False))
 
-    # Per-ticker events printing
-    for r in results:
-        print_events_table(r["ticker"], r["events"])
-
-    # Build trade log & event log dataframes
+    # ----- Build trade log dataframe -----
     trade_rows = []
-    event_rows = []
-
     for r in results:
         for log in r["trade_log"]:
             row = {"ticker": r["ticker"]}
             row.update(log)
             trade_rows.append(row)
 
-        for ev in r["events"]:
-            row = {"ticker": r["ticker"]}
-            row.update(ev)
-            event_rows.append(row)
-
     trade_df = pd.DataFrame(trade_rows)
     if "date" in trade_df.columns:
         trade_df["date"] = pd.to_datetime(trade_df["date"]).dt.tz_localize(None)
 
-    events_df = pd.DataFrame(event_rows)
-    if "date" in events_df.columns:
-        events_df["date"] = pd.to_datetime(events_df["date"]).dt.tz_localize(None)
-
-    # Portfolio-wide stats (combined cashflow)
+    # ----- Portfolio-wide stats (combined cashflow) -----
     total_invested = sum(r["invested"] for r in results)
     total_profit_booked = sum(r["profit_booked"] for r in results)
     total_held_value = sum(r["held_value"] for r in results)
     total_final_value = total_profit_booked + total_held_value
     total_pnl = total_final_value - total_invested
 
+    # Combined cashflows (treat as one portfolio)
     combined_cf = []
     for r in results:
         for log in r["trade_log"]:
@@ -725,6 +742,7 @@ if __name__ == "__main__":
             elif log["type"] == "SELL":
                 combined_cf.append((log["date"], log["realized"]))
 
+    # Single terminal cashflow at the global end date
     if results:
         portfolio_end = max(r["last_date"] for r in results)
         combined_cf.append((portfolio_end, total_held_value))
@@ -744,57 +762,63 @@ if __name__ == "__main__":
     else:
         print("Portfolio XIRR     : NaN")
 
-    # CSV / Excel exports
+    # ----- CSV / Excel exports -----
     summary.to_csv("strategy_results_b1_2.csv", index=False)
     trade_df.to_csv("trade_logs_b1_2.csv", index=False)
-    events_df.to_csv("event_logs_b1_2.csv", index=False)
     summary.to_excel("strategy_results_b1_2.xlsx", index=False)
     trade_df.to_excel("trade_logs_b1_2.xlsx", index=False)
-    events_df.to_excel("event_logs_b1_2.xlsx", index=False)
     marker_counts.to_csv("low_marker_counts_b1_2.csv", index=False)
 
     print("\nCSV/Excel reports saved:")
     print(" - strategy_results_b1_2.csv / .xlsx")
     print(" - trade_logs_b1_2.csv / .xlsx")
-    print(" - event_logs_b1_2.csv / .xlsx")
     print(" - low_marker_counts_b1_2.csv")
+
+    # ----- Print per-ticker event timelines -----
+    for r in results:
+        print_events_for_ticker(r["ticker"], r["events"])
 
     print("""
 ========= STRATEGY B1.2 DESCRIPTION (UPDATED) =========
 
 ENTRY LOGIC (B1.2):
   1) Track all-time-high (ATH) for each ticker.
-  2) When price drops 15% below ATH: first BUY (DD 15%).
-  3) When price drops 20% below ATH: second BUY (DD 20%).
-  4) When price drops 25% below ATH: third BUY (DD 25%).
-  5) Buy sizes (per ATH regime) = BUY_AMOUNT_1, BUY_AMOUNT_2, BUY_AMOUNT_3 (default 250/250/250).
+  2) When price drops 15% below ATH: first BUY.
+  3) When price drops 20% below ATH: second BUY.
+  4) When price drops 25% below ATH: third BUY.
+  5) Buy sizes (per ATH regime) = 250, 500, 750 USD (see FIRST/SECOND/THIRD_BUY_AMOUNT).
   6) Only buy if price > 200-day EMA (trend filter, no catching falling knives).
-  7) Hard cap: max invested per ticker in normal buys = MAX_NORMAL_CAP (default 3000 USD).
+  7) Hard cap: max invested per ticker = 3000 USD for normal buys (MAX_CAP_NORMAL).
   8) Realized profit from normal SELLs is accumulated in a low-marker pool
-     and is only deployed in HEAVY_BUY on deep capitulation days.
+     (not recycled into the next normal buy).
 
-LOW-MARKER HEAVY BUY:
+LOW-MARKER HEAVY BUY (with log-ATR and relaxed thresholds):
   - On any day where ALL of the following hold:
-      * Drawdown_from_ATH ≥ LOW_MARKER_DD_MIN (default 30%)
-      * Price ≤ EMA(200) * LOW_MARKER_EMA_MULT (default 0.85)
-      * Volume_today ≥ LOW_MARKER_VOL_MULT × Volume_60d_avg (default 1.3x)
-      * logATR_today ≥ LOW_MARKER_LOGATR_MULT × logATR_60d_avg (default 1.3x)
-      * (Close - Low) / (High - Low) ≥ LOW_MARKER_CLV_MIN (default 0.4)
-      * RSI(14) ≤ LOW_MARKER_RSI_MAX (default 40)
+      * Drawdown_from_ATH ≥ 30%
+      * Price ≤ 200d_EMA * 0.85
+      * Volume_today ≥ 1.3 × Volume_60d_avg
+      * logATR_today ≥ 1.3 × logATR_60d_avg
+      * (Close - Low) / (High - Low) ≥ 0.4
+      * RSI(14) ≤ 40
     then:
       * Execute a heavy BUY of (HEAVY_BASE_AMOUNT + accumulated low-marker pool).
-      * Heavy-buy cycles are never sold (is_heavy=True) and sit as long-term core.
+      * Heavy-buy cycles are never sold and do not affect the 3000 USD cap
+        for normal buys, though the invested amount is counted in 'invested'.
 
 EXIT / PROFIT-TAKING:
   - For each normal BUY, define take-profit levels at:
-      * TP_LEVELS (default [1.20, 1.40, 1.60] × ATH before correction)
-  - At each target hit, sell TP_FRACTIONS (default 15%) of TOTAL normal shares:
-      * SELL_TP1, SELL_TP2, SELL_TP3
+      * 1.20 × ATH before correction
+      * 1.40 × ATH before correction
+      * 1.60 × ATH before correction
+  - At each target hit, sell these fractions of TOTAL *normal* shares:
+      * 15% of total shares
+      * 15% of total shares
+      * 15% of total shares
   - Remaining normal shares plus all heavy-buy shares are held until the end.
   - Realized profit from these normal sells feeds into the low-marker pool.
 
 NOTES:
-  - 'xirr_pct' in the summary is expressed in percent (e.g. 76.71 = 76.71%).
+  - 'xirr_%' in the summary is expressed in PERCENT (e.g. 76.71 = 76.71%).
   - Portfolio-wide XIRR is computed using a combined cashflow method:
       * all BUY / HEAVY_BUY as negative cashflows,
       * all SELL realized amounts as positive cashflows,
