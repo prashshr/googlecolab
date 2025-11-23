@@ -10,10 +10,10 @@ from datetime import datetime
 # Data / universe
 START_DATE    = "2021-01-01"
 TICKERS       = ["NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
-                 "ASML", "CRWD", "META", "AVGO", "NOW"]
+                 "ASML", "GOOG", "META", "AVGO", "AAPL"]
 
 # Entry ladder (normal B1.2)
-DD_THRESHOLDS = [0.15, 0.20, 0.25]          # 15%, 20%, 25% from ATH
+DD_THRESHOLDS = [0.10, 0.15, 0.20]          # 15%, 20%, 25% from ATH
 TP_LEVELS     = [1.20, 1.40, 1.60]          # 1.2x, 1.4x, 1.6x ATH TP levels
 TP_FRACS      = [0.15, 0.15, 0.15]          # 15% of normal shares at each TP
 
