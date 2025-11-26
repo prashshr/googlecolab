@@ -592,12 +592,28 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
         date = pd.Timestamp(date)
 
         # Trend filter
-        if pd.isna(ema200.loc[date]) or price < ema200.loc[date]:
+        # -------- PATCHED TREND FILTER (Option A minimal patch) --------
+        dd = (ath_pre - price) / ath_pre
+
+        if dd >= 0.40:
+            trend_ok = True                      # deep DD → always allow
+        elif dd >= 0.25:
+            trend_ok = price <= ema200.loc[date] * 1.20
+        else:
+            trend_ok = price <= ema200.loc[date] * 1.05
+
+        if not trend_ok:
             continue
+        # ---------------------------------------------------------------
+
 
         # Identify new ATH → reset state machine
-        p.tp.set_ath(ath_pre)
-        print(f"{COLOR_CYAN}[STATE RESET]{COLOR_RESET} {date.date()} new ATH={ath_pre:.2f}")
+        # -------- PATCHED ATH DETECTOR --------
+        if (p.tp.ath_level is None) or (ath_pre > p.tp.ath_level):
+            p.tp.set_ath(ath_pre)
+            print(f"{COLOR_CYAN}[STATE RESET]{COLOR_RESET} {date.date()} new ATH={ath_pre:.2f}")
+        # --------------------------------------
+
 
         # Determine base amount from DD
         dd = (ath_pre - price) / ath_pre
