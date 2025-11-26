@@ -342,6 +342,9 @@ class Portfolio:
         self.invested = 0.0
         self.profit_booked = 0.0
         self.low_marker_pool = 0.0
+        self.gold_used = 0.0
+        self.tp_used = 0.0
+        self.new_money_used = 0.0
 
         # state machine
         self.tp = TPStateMachine()
@@ -372,14 +375,18 @@ class Portfolio:
             "reason": "NORMAL_BUY"
         })
 
+        self.trade_log[-1]["from_gold"] = 0.0
+        self.trade_log[-1]["from_tp_pool"] = 0.0
+        self.trade_log[-1]["from_new_money"] = float(amount)
+        
         return amount
 
     # ---------------------------------------------
     # Heavy buy (low-marker heavy buy)
     # ---------------------------------------------
     def heavy_buy(self, date, price, base_amount):
-        amount = base_amount + self.low_marker_pool
-        self.low_marker_pool = 0.0
+        # Fixed order size: do NOT add low_marker_pool here
+        amount = base_amount
 
         if amount <= 0:
             return 0.0
@@ -400,7 +407,13 @@ class Portfolio:
             "reason": "HEAVY_LOW_MARKER"
         })
 
+        # funding split will be set after we know gold_used / tp_used / new_money
+        self.trade_log[-1]["from_gold"] = 0.0
+        self.trade_log[-1]["from_tp_pool"] = 0.0
+        self.trade_log[-1]["from_new_money"] = float(amount)
+
         return amount
+
 
     # ---------------------------------------------
     # Sell fraction (only from normal cycles)
@@ -513,6 +526,16 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
     low = ohlcv["Low"]
     volume = ohlcv["Volume"]
 
+    # Build ATH-cycle IDs (increment whenever a new all-time high is set)
+    cycle_by_date = {}
+    cycle_id = 0
+    ath_running = -np.inf
+    for dt, px in close.items():
+        if px > ath_running:
+            ath_running = px
+            cycle_id += 1
+        cycle_by_date[dt] = cycle_id
+
     # EMA200 (SMA used here exactly like original)
     ema200 = close.rolling(200).mean()
     rsi14 = compute_rsi(close)
@@ -587,8 +610,31 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
 
         executed = p.buy(date, price, base_amt, MAX_NORM_CAP)
         if executed > 0:
-            gold_vault.withdraw_principal(date, executed)
-            print(f"{COLOR_GREEN}[BUY]{COLOR_RESET} {date.date()} {executed}@{price:.2f}")
+
+            # 1) Try gold principal
+            gold_used = gold_vault.withdraw_principal(date, executed)
+
+            # 2) Try TP pool next
+            tp_available = p.low_marker_pool
+            tp_used = min(tp_available, executed - gold_used)
+            p.low_marker_pool -= tp_used
+
+            # 3) Remaining is new personal money
+            new_money = executed - gold_used - tp_used
+
+            # --- Update portfolio source totals ---
+            p.gold_used += gold_used
+            p.tp_used += tp_used
+            p.new_money_used += new_money
+
+            # --- Update this BUY log row ---
+            p.trade_log[-1]["from_gold"] = float(gold_used)
+            p.trade_log[-1]["from_tp_pool"] = float(tp_used)
+            p.trade_log[-1]["from_new_money"] = float(new_money)
+
+            print(f"{COLOR_GREEN}[BUY]{COLOR_RESET} {date.date()} {executed}@{price:.2f}  "
+                f"(gold={gold_used:.2f}, tp={tp_used:.2f}, new={new_money:.2f})")
+
 
         # -------------------------
         # TAKE PROFIT STATE MACHINE
@@ -618,14 +664,48 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
     # -------------------------
     # HEAVY LOW-MARKER BUYS
     # -------------------------
+    heavy_counts = {}  # cycle_id -> heavy buys used
+
     for d in marker_dates:
         d = pd.Timestamp(d)
         price = close.loc[d]
 
+        cid = cycle_by_date[d]
+        if heavy_counts.get(cid, 0) >= 3:
+            # already did 3 heavy buys in this ATH cycle
+            continue
+
         executed = p.heavy_buy(d, price, HEAVY_BASE)
         if executed > 0:
-            gold_vault.withdraw_principal(d, executed)
-            print(f"{COLOR_BLUE}[HEAVY]{COLOR_RESET} {d.date()} {executed}@{price:.2f}")
+            heavy_counts[cid] = heavy_counts.get(cid, 0) + 1
+
+            # 1) Gold principal first
+            gold_used = gold_vault.withdraw_principal(d, executed)
+
+            # 2) TP pool
+            tp_available = p.low_marker_pool
+            tp_used = min(tp_available, executed - gold_used)
+            p.low_marker_pool -= tp_used
+
+            # 3) New money
+            new_money = executed - gold_used - tp_used
+
+            # Portfolio-level totals
+            p.gold_used += gold_used
+            p.tp_used += tp_used
+            p.new_money_used += new_money
+
+            # Update heavy buy log row (last row)
+            p.trade_log[-1]["from_gold"] = float(gold_used)
+            p.trade_log[-1]["from_tp_pool"] = float(tp_used)
+            p.trade_log[-1]["from_new_money"] = float(new_money)
+
+            print(
+                f"{COLOR_BLUE}[HEAVY]{COLOR_RESET} {d.date()} {executed}@{price:.2f}  "
+                f"(gold={gold_used:.2f}, tp={tp_used:.2f}, new={new_money:.2f})"
+            )
+
+
 
     # -------------------------
     # FINAL VALUATION
@@ -657,8 +737,12 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
         "held": held,
         "final_value": final,
         "pnl": pnl,
+        "gold_used": p.gold_used,
+        "tp_used": p.tp_used,
+        "new_money_used": p.new_money_used,
         "last_date": last_date
     }
+
 
     return result
 
@@ -699,7 +783,8 @@ def build_ticker_report(res):
 
     # Tidy display columns
     show = ["type", "date", "price", "amount", "shares",
-            "shares_sold", "realized", "profit", "reason"]
+            "shares_sold", "realized", "profit", "reason",
+            "from_gold", "from_tp_pool", "from_new_money"]
 
     for col in show:
         if col not in dfp.columns:
@@ -725,7 +810,10 @@ def build_global_summary(all_results):
             "profit_booked": r["profit"],
             "held_value": r["held"],
             "final_value": r["final_value"],
-            "pnl": r["pnl"]
+            "pnl": r["pnl"],
+            "gold_used": r["gold_used"],
+            "tp_used": r["tp_used"],
+            "new_money_used": r["new_money_used"]
         })
 
     df = pd.DataFrame(rows)
@@ -766,6 +854,13 @@ def build_global_summary(all_results):
     print(f"Portfolio XIRR      : {xirr_pct:,.2f}%")
     print("="*80)
 
+
+    print(f"Total gold used           : {df['gold_used'].sum():,.2f}")
+    print(f"Total TP profits reused   : {df['tp_used'].sum():,.2f}")
+    print(f"Total new money invested  : {df['new_money_used'].sum():,.2f}")
+
+
+
     return df, xirr_pct
 
 
@@ -774,8 +869,8 @@ def build_global_summary(all_results):
 # ---------------------------------------------------------------------------
 
 def gold_summary(gold_vault):
-    total_principal = gold_vault.total_principal_deposited
-    principal_left = gold_vault.principal_remaining()
+    total_principal = gold_vault.total_principal
+    principal_left = gold_vault.principal_left()
     value = gold_vault.current_value()
     profit = value - principal_left
 
@@ -810,7 +905,10 @@ def export_results(all_results):
             "profit_booked": r["profit"],
             "held_value": r["held"],
             "final_value": r["final_value"],
-            "pnl": r["pnl"]
+            "pnl": r["pnl"],
+            "gold_used": r["gold_used"],
+            "tp_used": r["tp_used"],
+            "new_money_used": r["new_money_used"]
         })
 
         df = r["trade_df"].copy()
