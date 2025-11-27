@@ -543,24 +543,33 @@ def compute_xirr(cashflows, guess=0.10):
 
 def detect_ath_events(close: pd.Series, signals):
     """
-    We only print 1 ATH per month:
-    - Identify the ATH right before each dip
-    - Deduplicate by month
+    Correct ATH detection:
+    - extract ath_pre from each B1 signal
+    - dedupe by month
     """
-    ath_dates = sorted({pd.Timestamp(s[0]) for s in signals})
+
+    # Extract ATH values and their correct dates
+    ath_list = []
+    for (dt, price, ath_pre) in signals:
+        # find the actual ATH date for ath_pre (peak before dip)
+        ath_date = close[close == ath_pre].index.min()
+        if pd.notna(ath_date):
+            ath_list.append((ath_date, ath_pre))
+
+    # De-duplicate by month
     monthly = {}
-    for d in ath_dates:
+    for d, px in ath_list:
         ym = (d.year, d.month)
         if ym not in monthly:
-            monthly[ym] = d
+            monthly[ym] = (d, px)
 
+    # Build event table
     result = []
-    for (y, m), d in monthly.items():
-        price = float(close.loc[d])
+    for ym, (d, px) in monthly.items():
         result.append({
             "type": "ATH_EVENT",
             "date": d,
-            "price": price,
+            "price": float(px),
             "amount": 0.0,
             "shares": 0.0,
             "shares_sold": 0.0,
@@ -570,6 +579,7 @@ def detect_ath_events(close: pd.Series, signals):
         })
 
     return result
+
 # ---------------------------------------------------------------------------
 # 7. RUN STRATEGY FOR ONE TICKER
 # ---------------------------------------------------------------------------
@@ -661,15 +671,19 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
         # -------- PATCHED TREND FILTER (Option A minimal patch) --------
         dd = (ath_pre - price) / ath_pre
 
-        if dd >= 0.40:
-            trend_ok = True                      # deep DD → always allow
-        elif dd >= 0.25:
-            trend_ok = price <= ema200.loc[date] * 1.20
-        else:
-            trend_ok = price <= ema200.loc[date] * 1.05
+        # Improved Trend Filter (Hybrid)
+        # Allows proper B1 signals on strong dips even in strong uptrends
 
-        if not trend_ok:
-            continue
+        if dd >= 0.40:
+            trend_ok = True      # deep crash → allow regardless of EMA
+        elif dd >= 0.25:
+            trend_ok = True      # 25% dip → allow always
+        elif dd >= 0.15:
+            # for 15–20% dips → allow if price is not too extended
+            trend_ok = price <= ema200.loc[date] * 1.30
+        else:
+            trend_ok = False
+
         # ---------------------------------------------------------------
 
 
