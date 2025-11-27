@@ -22,6 +22,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 
+
 # ---------------------------------------------------------------------------
 # ANSI COLORS FOR PRETTY TERMINAL OUTPUT
 # ---------------------------------------------------------------------------
@@ -34,6 +35,17 @@ COLOR_BLUE = "\033[34m"
 COLOR_CYAN = "\033[36m"
 COLOR_MAGENTA = "\033[35m"
 COLOR_WHITE = "\033[97m"
+
+# ---------------------------------------------------------------------------
+# GLOBAL CONFIGURATION CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Gold ticker used for the vault deposits (GLD or IAU are common)
+GOLD_TICKER = "GLD"
+
+# Monthly gold deposit amount
+MONTHLY_GOLD_DEPOSIT = 500.0
+
 
 # ---------------------------------------------------------------------------
 # 1. DATA LOADING HELPERS
@@ -469,6 +481,60 @@ class Portfolio:
     # ---------------------------------------------
     def current_value(self, price):
         return sum(c.shares * price for c in self.cycles)
+
+
+
+# ---------------------------------------------------------------------------
+# XIRR CALCULATION
+# ---------------------------------------------------------------------------
+
+def compute_xirr(cashflows, guess=0.10):
+    """
+    cashflows = list of tuples [(date, amount), ...]
+        amount < 0 → investment
+        amount > 0 → withdrawal / sell
+    guess = initial rate guess
+
+    Returns a decimal XIRR value (e.g. 0.15 = 15%).
+    """
+
+    # Convert to numpy-friendly arrays
+    dates = np.array([pd.Timestamp(d) for d, _ in cashflows])
+    amounts = np.array([a for _, a in cashflows], dtype=float)
+
+    # Convert dates to year fractions
+    t0 = dates[0]
+    years = np.array([(d - t0).days / 365.0 for d in dates], dtype=float)
+
+    # Define NPV function for rate r
+    def npv(r):
+        return np.sum(amounts / (1 + r)**years)
+
+    # Try Newton’s method
+    r = guess
+    for _ in range(200):
+        # Derivative of NPV wrt r
+        d_npv = np.sum(-years * amounts / (1 + r)**(years + 1))
+
+        if abs(d_npv) < 1e-12:   # prevent divide-by-zero
+            break
+
+        new_r = r - npv(r) / d_npv
+
+        if abs(new_r - r) < 1e-12:
+            return new_r
+
+        r = new_r
+
+    # Fallback: try simple bisection between -99% to +200%
+    lo, hi = -0.99, 2.00
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if npv(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return mid
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +1014,7 @@ def export_results(all_results):
 # ---------------------------------------------------------------------------
 
 def main():
-    start_date = "2021-01-01"
+    start_date = "2023-01-01"
 
     tickers = [
         "NVDA","MSFT","PLTR","TSLA","AMZN",
