@@ -45,34 +45,40 @@ COLOR_WHITE = "\033[97m"
 GOLD_TICKER = "GLD"
 
 # Monthly gold deposit amount
-MONTHLY_GOLD_DEPOSIT = 1500.0
+MONTHLY_GOLD_DEPOSIT = 50000.0
 
 # Strategy start date
-STRATEGY_START_DATE = "2023-01-01"
+STRATEGY_START_DATE = "2016-01-01"
 
 # Data loading start date (historical data)
-HISTORICAL_START_DATE = "2023-01-01"
+HISTORICAL_START_DATE = "2014-01-01"
 
 # List of tickers to process
+#TICKERS = [
+#    "NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
+#    "ASML", "GOOG", "META", "AVGO", "AAPL"
+#]
+
 TICKERS = [
-    "NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
-    "ASML", "GOOG", "META", "AVGO", "AAPL"
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
+    "ADANIGREEN.NS", "TATAPOWER.NS", "POLYCAB.NS", "DMART.NS", "TATAELXSI.NS"
 ]
+
 
 # B1 ladder thresholds (from ATH)
 B1_THRESHOLDS = [0.15, 0.20, 0.25]
 
 # B1 base amounts based on drawdown
-B1_BASE_AMOUNTS = {0.25: 750, 0.20: 500, 0.15: 250}
+B1_BASE_AMOUNTS = {0.25: 100000, 0.20: 50000, 0.15: 25000}
 
 # Maximum normal investment cap per ticker
-MAX_NORM_CAP = 2000.0
+MAX_NORM_CAP = 200000.0
 
 # Take-profit fraction per phase
 TP_FRAC = 0.15
 
 # Heavy buy base amount
-HEAVY_BASE = 1000.0
+HEAVY_BASE = 250000.0
 
 # Maximum heavy buys per ATH cycle
 MAX_HEAVY_PER_CYCLE = 3
