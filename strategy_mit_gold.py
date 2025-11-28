@@ -47,18 +47,18 @@ COLOR_WHITE = "\033[97m"
 GOLD_TICKER = "GLD"
 
 # Monthly gold deposit amount
-MONTHLY_GOLD_DEPOSIT = 1500.0
+MONTHLY_GOLD_DEPOSIT = 1000.0
 
 # Strategy start date
-STRATEGY_START_DATE = "2011-12-01"
+STRATEGY_START_DATE = "2021-12-01"
 
 # Data loading start date (historical data)
-HISTORICAL_START_DATE = "2009-01-01"
+HISTORICAL_START_DATE = "2019-01-01"
 
 # List of tickers to process
 TICKERS = [
     "NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
-    "ASML", "GOOG", "META", "AVGO", "AAPL"
+    "GOOG", "META", "AAPL"
 ]
 
 #TICKERS = [
@@ -76,8 +76,9 @@ ATR_PERIOD = 60
 
 # Checkpoint settings
 CHECKPOINT_FILE = "strategy_checkpoint.pkl"
-ENABLE_CHECKPOINTING = True
-RESUME_FROM_CHECKPOINT = True
+ENABLE_CHECKPOINTING = False
+RESUME_FROM_CHECKPOINT = False
+LOG_DIR = "logs"
 
 # Parameter sets
 DEFAULT_PARAMETERS = {
@@ -728,7 +729,7 @@ def detect_ath_events(close: pd.Series, signals):
 # 7. RUN STRATEGY FOR ONE TICKER
 # ---------------------------------------------------------------------------
 
-def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DATE):
+def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DATE, existing_state=None):
     """
     Runs full strategy for a single ticker.
     Includes:
@@ -769,6 +770,18 @@ def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DA
     low_marker_atr = params["LOW_MARKER_ATR_MULT"]
     low_marker_clv = params["LOW_MARKER_CLV_THRESH"]
     low_marker_rsi = params["LOW_MARKER_RSI_THRESH"]
+    resume_from = start_ts - pd.Timedelta(days=1)
+    if existing_state and existing_state.get("last_processed"):
+        resume_from = pd.Timestamp(existing_state["last_processed"])
+    if existing_state and existing_state.get("portfolio"):
+        p = existing_state["portfolio"]
+        p.params = params
+        if not hasattr(p, "heavy_counts"):
+            p.heavy_counts = {}
+        fresh_portfolio = False
+    else:
+        p = Portfolio(ticker, params)
+        fresh_portfolio = True
 
     high = ohlcv["High"]
     low = ohlcv["Low"]
@@ -819,21 +832,18 @@ def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DA
     low_marker = condA & condB & condC & condD & condE & condF
     marker_dates = [
         d for d in low_marker[low_marker].index
-        if pd.Timestamp(d) >= start_ts
+        if pd.Timestamp(d) > resume_from
     ]
 
     # B1 SIGNALS --------------------------------------------
     signals = [
         (d, price, ath_pre)
         for (d, price, ath_pre) in detect_bottoms_b1(close, b1_thresholds)
-        if pd.Timestamp(d) >= start_ts
+        if pd.Timestamp(d) > resume_from
     ]
 
-    # PORTFOLIO for this ticker
-    p = Portfolio(ticker, params)
-
-    # Filter ATH events
-    ath_events = detect_ath_events(close, signals)
+    prior_ath_events = list(existing_state.get("ath_events", [])) if existing_state else []
+    ath_events = prior_ath_events + detect_ath_events(close, signals)
     tp_cycles = []
     last_tp_cycle_ath = -np.inf
 
@@ -902,10 +912,11 @@ def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DA
         for row in p.trade_log
         if row["type"] == "BUY"
     ]
-    tp_start = min(buy_dates) if buy_dates else pd.Timestamp(start_date)
+    tp_start = max(resume_from + pd.Timedelta(days=1), pd.Timestamp(start_date))
 
     future_dates = close[close.index >= tp_start].index
-    p.tp.reset()
+    if fresh_portfolio:
+        p.tp.reset()
     tp_cycle_idx = -1
 
     for check_date in future_dates:
@@ -958,7 +969,7 @@ def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DA
     # -------------------------
     # HEAVY LOW-MARKER BUYS
     # -------------------------
-    heavy_counts = {}  # cycle_id -> heavy buys used
+    heavy_counts = getattr(p, "heavy_counts", {})
 
     for d in marker_dates:
         d = pd.Timestamp(d)
@@ -1003,6 +1014,7 @@ def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DA
     # FINAL VALUATION
     # -------------------------
     last_date = close.index[-1]
+    p.heavy_counts = heavy_counts
     last_price = float(close.iloc[-1])
 
     held = p.current_value(last_price)
@@ -1032,7 +1044,9 @@ def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DA
         "gold_used": p.gold_used,
         "tp_used": p.tp_used,
         "new_money_used": p.new_money_used,
-        "last_date": last_date
+        "last_date": last_date,
+        "portfolio": p,
+        "ath_events": ath_events
     }
 
     return result
@@ -1179,10 +1193,11 @@ def gold_summary(gold_vault):
 # 11. CSV / EXCEL EXPORTS
 # ---------------------------------------------------------------------------
 
-def export_results(all_results):
+def export_results(all_results, gold_vault, run_dir):
     """
     Saves per-ticker and combined reports.
     """
+    os.makedirs(run_dir, exist_ok=True)
 
     # Ticker summaries
     rows = []
@@ -1208,11 +1223,25 @@ def export_results(all_results):
     summary_df = pd.DataFrame(rows)
     trades_df = pd.concat(trade_rows, ignore_index=True)
 
-    summary_df.to_csv("summary.csv", index=False)
-    trades_df.to_csv("trades.csv", index=False)
+    summary_path = os.path.join(run_dir, "summary.csv")
+    trades_path = os.path.join(run_dir, "trades.csv")
+    summary_xlsx_path = os.path.join(run_dir, "summary.xlsx")
+    trades_xlsx_path = os.path.join(run_dir, "trades.xlsx")
+    summary_df.to_csv(summary_path, index=False)
+    trades_df.to_csv(trades_path, index=False)
+    summary_df.to_excel(summary_xlsx_path, index=False)
+    trades_df.to_excel(trades_xlsx_path, index=False)
 
-    summary_df.to_excel("summary.xlsx", index=False)
-    trades_df.to_excel("trades.xlsx", index=False)
+    state_df = pd.DataFrame([{
+        "gold_total_principal": gold_vault.total_principal,
+        "gold_principal_left": gold_vault.principal_left(),
+        "gold_value": gold_vault.current_value(),
+        "gold_profit": gold_vault.current_value() - gold_vault.principal_left()
+    }])
+    state_csv = os.path.join(run_dir, "state_snapshot.csv")
+    state_xlsx = os.path.join(run_dir, "state_snapshot.xlsx")
+    state_df.to_csv(state_csv, index=False)
+    state_df.to_excel(state_xlsx, index=False)
 
     print(f"{COLOR_GREEN}CSV and Excel exported: summary.*, trades.*{COLOR_RESET}")
 
@@ -1224,10 +1253,18 @@ def export_results(all_results):
 def main():
     print(f"{COLOR_YELLOW}Setting up GOLD VAULT (LIFO PRINCIPAL ONLY)...{COLOR_RESET}")
     gold_close = load_close(GOLD_TICKER, STRATEGY_START_DATE)
-    gold_vault = GoldVault(gold_close)
+    checkpoint = load_checkpoint()
+    if checkpoint:
+        gold_vault = checkpoint.get("gold_vault", GoldVault(gold_close))
+        gold_vault.prices = gold_close
+        ticker_states = checkpoint.get("tickers", {})
+        current = pd.Timestamp(checkpoint.get("gold_next_deposit", STRATEGY_START_DATE))
+    else:
+        gold_vault = GoldVault(gold_close)
+        ticker_states = {}
+        current = pd.Timestamp(STRATEGY_START_DATE)
 
     # Monthly deposits -------------------------------------
-    current = pd.Timestamp(STRATEGY_START_DATE)
     last_gold = gold_close.index[-1]
 
     while current <= last_gold:
@@ -1239,25 +1276,59 @@ def main():
         y = current.year + (1 if current.month == 12 else 0)
         m = 1 if current.month == 12 else current.month + 1
         current = pd.Timestamp(year=y, month=m, day=1)
+    next_gold_deposit = current
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(LOG_DIR, f"run_{run_stamp}")
 
     print(f"{COLOR_WHITE}\nRUNNING FULL STRATEGY...\n{COLOR_RESET}")
 
     all_results = []
+    new_ticker_states = {}
+    processed_tickers = set()
     for t in TICKERS:
         params = resolve_parameters(t)
+        existing = ticker_states.get(t) if ticker_states else None
         print(f"{COLOR_CYAN}\nProcessing {t}...{COLOR_RESET}")
-        res = run_ticker_strategy(t, gold_vault, params, STRATEGY_START_DATE)
+        res = run_ticker_strategy(t, gold_vault, params, STRATEGY_START_DATE, existing_state=existing)
         if res is None:
             continue
         all_results.append(res)
+        processed_tickers.add(t)
+        snapshot = {k: v for k, v in res.items() if k != "portfolio"}
+        new_ticker_states[t] = {
+            "portfolio": res["portfolio"],
+            "last_processed": res["last_date"],
+            "ath_events": res["ath_events"],
+            "snapshot": snapshot
+        }
         build_ticker_report(res)
+
+    # Include previously held tickers even if not processed this run
+    for t, state in (ticker_states or {}).items():
+        if t in processed_tickers:
+            continue
+        snap = state.get("snapshot")
+        if snap:
+            all_results.append(snap)
+        if t not in new_ticker_states:
+            new_ticker_states[t] = state
 
     # GLOBAL summaries
     build_global_summary(all_results)
     gold_summary(gold_vault)
 
     # Exports
-    export_results(all_results)
+    export_results(all_results, gold_vault, run_dir)
+
+    checkpoint_state = {
+        "gold_vault": gold_vault,
+        "gold_next_deposit": next_gold_deposit,
+        "tickers": new_ticker_states,
+        "last_run": pd.Timestamp.utcnow()
+    }
+    save_checkpoint(checkpoint_state)
 
     print(f"{COLOR_GREEN}\nALL DONE — FULL STRATEGY COMPLETED.{COLOR_RESET}")
 
