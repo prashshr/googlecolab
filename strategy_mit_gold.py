@@ -45,13 +45,13 @@ COLOR_WHITE = "\033[97m"
 GOLD_TICKER = "GLD"
 
 # Monthly gold deposit amount
-MONTHLY_GOLD_DEPOSIT = 1000.0
+MONTHLY_GOLD_DEPOSIT = 1500.0
 
 # Strategy start date
-STRATEGY_START_DATE = "2022-01-01"
+STRATEGY_START_DATE = "2023-01-01"
 
 # Data loading start date (historical data)
-HISTORICAL_START_DATE = "2018-01-01"
+HISTORICAL_START_DATE = "2023-01-01"
 
 # List of tickers to process
 TICKERS = [
@@ -678,6 +678,8 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
         print(f"{COLOR_RED}[SKIP]{COLOR_RESET} {ticker}: no OHLCV data available.")
         return None
 
+    start_ts = pd.Timestamp(start_date)
+
     high = ohlcv["High"]
     low = ohlcv["Low"]
     volume = ohlcv["Volume"]
@@ -725,10 +727,17 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
     condF = rsi14 <= LOW_MARKER_RSI_THRESH
 
     low_marker = condA & condB & condC & condD & condE & condF
-    marker_dates = list(low_marker[low_marker].index)
+    marker_dates = [
+        d for d in low_marker[low_marker].index
+        if pd.Timestamp(d) >= start_ts
+    ]
 
     # B1 SIGNALS --------------------------------------------
-    signals = detect_bottoms_b1(close, B1_THRESHOLDS)
+    signals = [
+        (d, price, ath_pre)
+        for (d, price, ath_pre) in detect_bottoms_b1(close, B1_THRESHOLDS)
+        if pd.Timestamp(d) >= start_ts
+    ]
 
     # PORTFOLIO for this ticker
     p = Portfolio(ticker)
