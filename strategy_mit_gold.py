@@ -36,6 +36,7 @@ COLOR_CYAN = "\033[36m"
 COLOR_MAGENTA = "\033[35m"
 COLOR_WHITE = "\033[97m"
 
+
 # ---------------------------------------------------------------------------
 # GLOBAL CONFIGURATION CONSTANTS
 # ---------------------------------------------------------------------------
@@ -45,6 +46,66 @@ GOLD_TICKER = "GLD"
 
 # Monthly gold deposit amount
 MONTHLY_GOLD_DEPOSIT = 500.0
+
+# Strategy start date
+STRATEGY_START_DATE = "2022-01-01"
+
+# Data loading start date (historical data)
+HISTORICAL_START_DATE = "2018-01-01"
+
+# List of tickers to process
+TICKERS = [
+    "NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
+    "ASML", "GOOG", "META", "AVGO", "AAPL"
+]
+
+# B1 ladder thresholds (from ATH)
+B1_THRESHOLDS = [0.15, 0.20, 0.25]
+
+# B1 base amounts based on drawdown
+B1_BASE_AMOUNTS = {0.25: 750, 0.20: 500, 0.15: 250}
+
+# Maximum normal investment cap per ticker
+MAX_NORM_CAP = 2000.0
+
+# Take-profit fraction per phase
+TP_FRAC = 0.15
+
+# Heavy buy base amount
+HEAVY_BASE = 1000.0
+
+# Maximum heavy buys per ATH cycle
+MAX_HEAVY_PER_CYCLE = 3
+
+# Low-marker conditions
+LOW_MARKER_DRAWDOWN_THRESH = 0.30
+LOW_MARKER_EMA_MULT = 0.85
+LOW_MARKER_VOL_MULT = 1.3
+LOW_MARKER_ATR_MULT = 1.3
+LOW_MARKER_CLV_THRESH = 0.40
+LOW_MARKER_RSI_THRESH = 40
+
+# Trend filter thresholds
+TREND_FILTER_DEEP_CRASH = 0.40
+TREND_FILTER_DIP_25 = 0.25
+TREND_FILTER_DIP_15_TO_20 = 0.15
+TREND_FILTER_EMA_EXTENDED = 1.30
+
+# TP multipliers
+TP1_MULT = 1.20
+TP2_MULT = 1.40
+TP3_MULT = 1.60
+
+# Technical indicators periods
+RSI_PERIOD = 14
+EMA_PERIOD = 200
+VOL_PERIOD = 60
+ATR_PERIOD = 60
+
+# Numerical tolerances
+EPSILON_SHARES = 1e-12
+EPSILON_PRINCIPAL = 1e-9
+EPSILON_XIRR = 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +184,7 @@ def load_ohlcv(ticker: str, start="2015-01-01") -> pd.DataFrame:
 # 2. RSI CALCULATION
 # ---------------------------------------------------------------------------
 
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     """
     Standard RSI using Wilder's smoothing.
     """
@@ -264,7 +325,7 @@ class GoldVault:
         # Clean empty lots
         self.lots = [
             x for x in self.lots
-            if x.shares > 1e-9 or x.principal_remaining > 1e-9
+            if x.shares > EPSILON_PRINCIPAL or x.principal_remaining > EPSILON_PRINCIPAL
         ]
 
         if withdrawn > 0:
@@ -283,6 +344,8 @@ class GoldVault:
     # --- Principal remaining ---------------------------------------------
     def principal_left(self):
         return sum(l.principal_remaining for l in self.lots)
+
+
 # ---------------------------------------------------------------------------
 # 5. PORTFOLIO ENGINE (NORMAL BUYS + HEAVY BUYS + STATE-MACHINE TPs)
 # ---------------------------------------------------------------------------
@@ -310,12 +373,17 @@ class TPStateMachine:
         self.reset()
 
     def reset(self):
-        self.phase = "WAIT_FOR_ATH"     # waiting for a new ATH
-        self.ath_level = None           # float ATH value
+        self.phase = "WAIT_FOR_ATH"  # waiting for a new ATH
+        self.ath_level = None  # float ATH value
+        # reset TP stage flags
+        if hasattr(self, 'parent'):
+            self.parent.tp1_done = False
+            self.parent.tp2_done = False
+            self.parent.tp3_done = False
 
     def set_ath(self, ath):
         self.ath_level = float(ath)
-        self.phase = "TP1"              # enable TP1
+        self.phase = "TP1"  # enable TP1
 
     def next_phase(self):
         if self.phase == "TP1":
@@ -330,11 +398,11 @@ class TPStateMachine:
 
     def required_multiplier(self):
         if self.phase == "TP1":
-            return 1.20
+            return TP1_MULT
         if self.phase == "TP2":
-            return 1.40
+            return TP2_MULT
         if self.phase == "TP3":
-            return 1.60
+            return TP3_MULT
         return None
 
 
@@ -358,8 +426,14 @@ class Portfolio:
         self.tp_used = 0.0
         self.new_money_used = 0.0
 
+        # TP flags
+        self.tp1_done = False
+        self.tp2_done = False
+        self.tp3_done = False
+
         # state machine
         self.tp = TPStateMachine()
+        self.tp.parent = self
 
     # ---------------------------------------------
     # Normal buy (never uses low-marker pool)
@@ -390,7 +464,7 @@ class Portfolio:
         self.trade_log[-1]["from_gold"] = 0.0
         self.trade_log[-1]["from_tp_pool"] = 0.0
         self.trade_log[-1]["from_new_money"] = float(amount)
-        
+
         return amount
 
     # ---------------------------------------------
@@ -425,7 +499,6 @@ class Portfolio:
         self.trade_log[-1]["from_new_money"] = float(amount)
 
         return amount
-
 
     # ---------------------------------------------
     # Sell fraction (only from normal cycles)
@@ -472,7 +545,7 @@ class Portfolio:
         })
 
         # remove empty cycles
-        self.cycles = [c for c in self.cycles if c.shares > 1e-12]
+        self.cycles = [c for c in self.cycles if c.shares > EPSILON_SHARES]
 
         return realized_total
 
@@ -481,7 +554,6 @@ class Portfolio:
     # ---------------------------------------------
     def current_value(self, price):
         return sum(c.shares * price for c in self.cycles)
-
 
 
 # ---------------------------------------------------------------------------
@@ -516,12 +588,12 @@ def compute_xirr(cashflows, guess=0.10):
         # Derivative of NPV wrt r
         d_npv = np.sum(-years * amounts / (1 + r)**(years + 1))
 
-        if abs(d_npv) < 1e-12:   # prevent divide-by-zero
+        if abs(d_npv) < EPSILON_XIRR:  # prevent divide-by-zero
             break
 
         new_r = r - npv(r) / d_npv
 
-        if abs(new_r - r) < 1e-12:
+        if abs(new_r - r) < EPSILON_XIRR:
             return new_r
 
         r = new_r
@@ -580,11 +652,12 @@ def detect_ath_events(close: pd.Series, signals):
 
     return result
 
+
 # ---------------------------------------------------------------------------
 # 7. RUN STRATEGY FOR ONE TICKER
 # ---------------------------------------------------------------------------
 
-def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
+def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
     """
     Runs full strategy for a single ticker.
     Includes:
@@ -595,8 +668,15 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
     - trade log assembly
     """
 
-    close = load_close(ticker, start_date)
-    ohlcv = load_ohlcv(ticker, start_date).reindex(close.index)
+    close = load_close(ticker, HISTORICAL_START_DATE)
+    if close.empty:
+        print(f"{COLOR_RED}[SKIP]{COLOR_RESET} {ticker}: no price data available.")
+        return None
+
+    ohlcv = load_ohlcv(ticker, HISTORICAL_START_DATE).reindex(close.index)
+    if ohlcv.empty:
+        print(f"{COLOR_RED}[SKIP]{COLOR_RESET} {ticker}: no OHLCV data available.")
+        return None
 
     high = ohlcv["High"]
     low = ohlcv["Low"]
@@ -613,7 +693,7 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
         cycle_by_date[dt] = cycle_id
 
     # EMA200 (SMA used here exactly like original)
-    ema200 = close.rolling(200).mean()
+    ema200 = close.rolling(EMA_PERIOD).mean()
     rsi14 = compute_rsi(close)
 
     # LOG ATR ---------------------------------------------
@@ -627,8 +707,8 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
     lr3 = (log_low - log_prev).abs()
     log_tr = pd.concat([lr1, lr2, lr3], axis=1).max(axis=1)
 
-    vol60 = volume.rolling(60).mean()
-    atr60 = log_tr.rolling(60).mean()
+    vol60 = volume.rolling(VOL_PERIOD).mean()
+    atr60 = log_tr.rolling(ATR_PERIOD).mean()
 
     # DRAWDOWN & CLV ----------------------------------------
     ath_series = close.cummax()
@@ -637,76 +717,58 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
     clv = (close - low) / day_range
 
     # LOW-MARKER CONDITION ----------------------------------
-    condA = drawdown >= 0.30
-    condB = close <= ema200 * 0.85
-    condC = volume >= vol60 * 1.3
-    condD = log_tr >= atr60 * 1.3
-    condE = clv >= 0.40
-    condF = rsi14 <= 40
+    condA = drawdown >= LOW_MARKER_DRAWDOWN_THRESH
+    condB = close <= ema200 * LOW_MARKER_EMA_MULT
+    condC = volume >= vol60 * LOW_MARKER_VOL_MULT
+    condD = log_tr >= atr60 * LOW_MARKER_ATR_MULT
+    condE = clv >= LOW_MARKER_CLV_THRESH
+    condF = rsi14 <= LOW_MARKER_RSI_THRESH
 
     low_marker = condA & condB & condC & condD & condE & condF
     marker_dates = list(low_marker[low_marker].index)
 
     # B1 SIGNALS --------------------------------------------
-    thresholds = [0.15, 0.20, 0.25]
-    signals = detect_bottoms_b1(close, thresholds)
+    signals = detect_bottoms_b1(close, B1_THRESHOLDS)
 
     # PORTFOLIO for this ticker
     p = Portfolio(ticker)
 
     # Filter ATH events
     ath_events = detect_ath_events(close, signals)
+    tp_cycles = []
+    last_tp_cycle_ath = -np.inf
 
     # -------------------------
-    # MAIN STRATEGY LOOP
+    # MAIN STRATEGY LOOP - PROCESS BUYS THEN TPS
     # -------------------------
-    MAX_NORM_CAP = 3000.0
-    TP_FRAC = 0.15
-    HEAVY_BASE = 1000.0
-
+    
     for (date, price, ath_pre) in signals:
         date = pd.Timestamp(date)
 
         # Trend filter
-        # -------- PATCHED TREND FILTER (Option A minimal patch) --------
         dd = (ath_pre - price) / ath_pre
 
-        # Improved Trend Filter (Hybrid)
-        # Allows proper B1 signals on strong dips even in strong uptrends
-
-        if dd >= 0.40:
-            trend_ok = True      # deep crash → allow regardless of EMA
-        elif dd >= 0.25:
-            trend_ok = True      # 25% dip → allow always
-        elif dd >= 0.15:
-            # for 15–20% dips → allow if price is not too extended
-            trend_ok = price <= ema200.loc[date] * 1.30
+        if dd >= TREND_FILTER_DEEP_CRASH:
+            trend_ok = True
+        elif dd >= TREND_FILTER_DIP_25:
+            trend_ok = True
+        elif dd >= TREND_FILTER_DIP_15_TO_20:
+            trend_ok = price <= ema200.loc[date] * TREND_FILTER_EMA_EXTENDED
         else:
             trend_ok = False
 
-        # ---------------------------------------------------------------
-
-
-        # Identify new ATH → reset state machine
-        # -------- PATCHED ATH DETECTOR --------
-        if (p.tp.ath_level is None) or (ath_pre > p.tp.ath_level):
-            p.tp.set_ath(ath_pre)
-            print(f"{COLOR_CYAN}[STATE RESET]{COLOR_RESET} {date.date()} new ATH={ath_pre:.2f}")
-        # --------------------------------------
-
+        if not trend_ok:
+            continue
 
         # Determine base amount from DD
-        dd = (ath_pre - price) / ath_pre
-        if dd >= 0.25:
-            base_amt = 750
-        elif dd >= 0.20:
-            base_amt = 500
-        else:
-            base_amt = 250
+        base_amt = B1_BASE_AMOUNTS.get(dd // 0.05 * 0.05, B1_BASE_AMOUNTS[0.15])
 
         executed = p.buy(date, price, base_amt, MAX_NORM_CAP)
         if executed > 0:
-
+            if ath_pre > last_tp_cycle_ath + 1e-9:
+                tp_cycles.append((date, ath_pre))
+                last_tp_cycle_ath = ath_pre
+                print(f"{COLOR_CYAN}[STATE RESET]{COLOR_RESET} {date.date()} new ATH={ath_pre:.2f}")
             # 1) Try gold principal
             gold_used = gold_vault.withdraw_principal(date, executed)
 
@@ -718,44 +780,74 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
             # 3) Remaining is new personal money
             new_money = executed - gold_used - tp_used
 
-            # --- Update portfolio source totals ---
+            # Update portfolio source totals
             p.gold_used += gold_used
             p.tp_used += tp_used
             p.new_money_used += new_money
 
-            # --- Update this BUY log row ---
+            # Update this BUY log row
             p.trade_log[-1]["from_gold"] = float(gold_used)
             p.trade_log[-1]["from_tp_pool"] = float(tp_used)
             p.trade_log[-1]["from_new_money"] = float(new_money)
 
-            print(f"{COLOR_GREEN}[BUY]{COLOR_RESET} {date.date()} {executed}@{price:.2f}  "
-                f"(gold={gold_used:.2f}, tp={tp_used:.2f}, new={new_money:.2f})")
+            print(f"{COLOR_GREEN}[BUY]{COLOR_RESET} {date.date()} {executed}@{price:.2f} "
+                  f"(gold={gold_used:.2f}, tp={tp_used:.2f}, new={new_money:.2f})")
 
 
-        # -------------------------
-        # TAKE PROFIT STATE MACHINE
-        # -------------------------
-        future = close[close.index > date]
+    # -------------------------
+    # TAKE PROFIT PROCESSING - STRICT SEQUENTIAL TP1 → TP2 → TP3
+    # -------------------------
 
-        while p.tp.can_tp():
-            mult = p.tp.required_multiplier()
-            target = ath_pre * mult
+    future_dates = close[close.index >= pd.Timestamp(STRATEGY_START_DATE)].index
+    p.tp.reset()
+    tp_cycle_idx = -1
 
-            hit = future[future >= target]
-            if hit.empty:
-                break
+    for check_date in future_dates:
+        check_price = close.loc[check_date]
 
-            hit_date = hit.index[0]
-            hit_price = hit.iloc[0]
+        while tp_cycle_idx + 1 < len(tp_cycles) and tp_cycles[tp_cycle_idx + 1][0] <= check_date:
+            tp_cycle_idx += 1
+            _, cycle_ath = tp_cycles[tp_cycle_idx]
+            p.tp.reset()
+            p.tp.set_ath(cycle_ath)
 
-            prof = p.sell_fraction(hit_date, hit_price, TP_FRAC, f"TP_{p.tp.phase}")
-            print(f"{COLOR_MAGENTA}[TP]{COLOR_RESET} {hit_date.date()} sell@{hit_price:.2f}, prof={prof:.2f}")
+        if p.tp.ath_level is None:
+            continue
 
-            # advance state
-            p.tp.next_phase()
+        # If no normal shares, skip
+        normal_shares = sum(c.shares for c in p.cycles if not c.heavy)
+        if normal_shares <= EPSILON_SHARES:
+            continue
 
-            # reduce future window
-            future = future[future.index > hit_date]
+        # Determine which TP phase to check
+        if not p.tp1_done:
+            phase = "TP1"
+            multiplier = TP1_MULT
+        elif not p.tp2_done:
+            phase = "TP2"
+            multiplier = TP2_MULT
+        elif not p.tp3_done:
+            phase = "TP3"
+            multiplier = TP3_MULT
+        else:
+            # all TPs done → wait for next ATH
+            continue
+
+        # Check if TP target is met
+        target = p.tp.ath_level * multiplier
+
+        if check_price >= target:
+            prof = p.sell_fraction(check_date, check_price, TP_FRAC, f"TP_{phase}")
+            print(f"{COLOR_MAGENTA}[TP]{COLOR_RESET} {check_date.date()} sell@{check_price:.2f}, prof={prof:.2f}")
+
+            if phase == "TP1":
+                p.tp1_done = True
+            elif phase == "TP2":
+                p.tp2_done = True
+            elif phase == "TP3":
+                p.tp3_done = True
+
+            continue
 
     # -------------------------
     # HEAVY LOW-MARKER BUYS
@@ -767,7 +859,7 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
         price = close.loc[d]
 
         cid = cycle_by_date[d]
-        if heavy_counts.get(cid, 0) >= 3:
+        if heavy_counts.get(cid, 0) >= MAX_HEAVY_PER_CYCLE:
             # already did 3 heavy buys in this ATH cycle
             continue
 
@@ -797,11 +889,9 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
             p.trade_log[-1]["from_new_money"] = float(new_money)
 
             print(
-                f"{COLOR_BLUE}[HEAVY]{COLOR_RESET} {d.date()} {executed}@{price:.2f}  "
+                f"{COLOR_BLUE}[HEAVY]{COLOR_RESET} {d.date()} {executed}@{price:.2f} "
                 f"(gold={gold_used:.2f}, tp={tp_used:.2f}, new={new_money:.2f})"
             )
-
-
 
     # -------------------------
     # FINAL VALUATION
@@ -838,7 +928,6 @@ def run_ticker_strategy(ticker, gold_vault, start_date="2021-01-01"):
         "new_money_used": p.new_money_used,
         "last_date": last_date
     }
-
 
     return result
 
@@ -887,6 +976,8 @@ def build_ticker_report(res):
             dfp[col] = ""
 
     print(dfp[show].to_string(index=False))
+
+
 # ---------------------------------------------------------------------------
 # 9. GLOBAL PORTFOLIO SUMMARY (ALL TICKERS)
 # ---------------------------------------------------------------------------
@@ -942,20 +1033,17 @@ def build_global_summary(all_results):
     print("="*80)
     print(df.to_string(index=False))
     print("-"*80)
-    print(f"Total invested      : {total_inv:,.2f}")
+    print(f"Total invested : {total_inv:,.2f}")
     print(f"Total profit booked : {total_profit:,.2f}")
-    print(f"Total held value    : {total_held:,.2f}")
-    print(f"Total final value   : {final_value:,.2f}")
-    print(f"Total PnL           : {pnl:,.2f}")
-    print(f"Portfolio XIRR      : {xirr_pct:,.2f}%")
+    print(f"Total held value : {total_held:,.2f}")
+    print(f"Total final value : {final_value:,.2f}")
+    print(f"Total PnL : {pnl:,.2f}")
+    print(f"Portfolio XIRR : {xirr_pct:,.2f}%")
     print("="*80)
 
-
-    print(f"Total gold used           : {df['gold_used'].sum():,.2f}")
-    print(f"Total TP profits reused   : {df['tp_used'].sum():,.2f}")
-    print(f"Total new money invested  : {df['new_money_used'].sum():,.2f}")
-
-
+    print(f"Total gold used : {df['gold_used'].sum():,.2f}")
+    print(f"Total TP profits reused : {df['tp_used'].sum():,.2f}")
+    print(f"Total new money invested : {df['new_money_used'].sum():,.2f}")
 
     return df, xirr_pct
 
@@ -973,10 +1061,10 @@ def gold_summary(gold_vault):
     print("\n" + "="*80)
     print(f"{COLOR_YELLOW}GOLD VAULT SUMMARY — PRINCIPAL-ONLY (LIFO){COLOR_RESET}")
     print("="*80)
-    print(f"Gold ticker                     : {GOLD_TICKER}")
-    print(f"Total principal deposited       : {total_principal:,.2f}")
+    print(f"Gold ticker : {GOLD_TICKER}")
+    print(f"Total principal deposited : {total_principal:,.2f}")
     print(f"Principal still spendable (LIFO): {principal_left:,.2f}")
-    print(f"Gold current market value       : {value:,.2f}")
+    print(f"Gold current market value : {value:,.2f}")
     print(f"Gold profit (value - principal) : {profit:,.2f}")
     print("="*80)
 
@@ -1028,19 +1116,12 @@ def export_results(all_results):
 # ---------------------------------------------------------------------------
 
 def main():
-    start_date = "2023-01-01"
-
-    tickers = [
-        "NVDA","MSFT","PLTR","TSLA","AMZN",
-        "ASML","GOOG","META","AVGO","AAPL"
-    ]
-
     print(f"{COLOR_YELLOW}Setting up GOLD VAULT (LIFO PRINCIPAL ONLY)...{COLOR_RESET}")
-    gold_close = load_close(GOLD_TICKER, start_date)
+    gold_close = load_close(GOLD_TICKER, STRATEGY_START_DATE)
     gold_vault = GoldVault(gold_close)
 
     # Monthly deposits -------------------------------------
-    current = pd.Timestamp(start_date)
+    current = pd.Timestamp(STRATEGY_START_DATE)
     last_gold = gold_close.index[-1]
 
     while current <= last_gold:
@@ -1056,9 +1137,11 @@ def main():
     print(f"{COLOR_WHITE}\nRUNNING FULL STRATEGY...\n{COLOR_RESET}")
 
     all_results = []
-    for t in tickers:
+    for t in TICKERS:
         print(f"{COLOR_CYAN}\nProcessing {t}...{COLOR_RESET}")
-        res = run_ticker_strategy(t, gold_vault, start_date)
+        res = run_ticker_strategy(t, gold_vault, STRATEGY_START_DATE)
+        if res is None:
+            continue
         all_results.append(res)
         build_ticker_report(res)
 
@@ -1072,7 +1155,6 @@ def main():
     print(f"{COLOR_GREEN}\nALL DONE — FULL STRATEGY COMPLETED.{COLOR_RESET}")
 
 
-
 # ---------------------------------------------------------------------------
 # 13. PRINT FULL STRATEGY SUMMARY AT END OF SCRIPT
 # ---------------------------------------------------------------------------
@@ -1082,14 +1164,14 @@ def print_strategy_summary():
     print(f"{COLOR_WHITE}STRATEGY SUMMARY — FULL LOGIC OVERVIEW{COLOR_RESET}")
     print("="*100)
 
-    print(f"""
+    print(f"""\
 ENTRY LOGIC (B1 LADDER)
 -----------------------
 1. Track ATH (All-Time-High) for each ticker.
 2. When price drops below ATH by:
-       - 15%  → BUY 250 USD
-       - 20%  → BUY 500 USD
-       - 25%  → BUY 750 USD
+       - 15% → BUY 250 USD
+       - 20% → BUY 500 USD
+       - 25% → BUY 750 USD
 3. Buy only if price is ABOVE the 200-day EMA (trend filter).
 4. Normal buy cap: max 3,000 USD invested per ticker.
 5. All normal BUYs are funded from GOLD VAULT principal (if available).
@@ -1142,11 +1224,11 @@ GOLD VAULT (LIFO PRINCIPAL-ONLY WITH DATE VALIDATION)
 PORTFOLIO VALUATION (PER TICKER)
 ---------------------------------
 For each ticker we report:
-    invested        — total BUY amounts
-    profit_booked   — realized gains from TP sells
-    held_value      — final value of remaining shares
-    final_value     — held_value + profit_booked
-    pnl             — final_value - invested
+    invested — total BUY amounts
+    profit_booked — realized gains from TP sells
+    held_value — final value of remaining shares
+    final_value — held_value + profit_booked
+    pnl — final_value - invested
 
 REPORTING OUTPUT
 ----------------
