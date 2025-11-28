@@ -17,6 +17,8 @@ Features:
 - Clean printing with ANSI colors for readability
 """
 
+import os
+import pickle
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -45,73 +47,133 @@ COLOR_WHITE = "\033[97m"
 GOLD_TICKER = "GLD"
 
 # Monthly gold deposit amount
-MONTHLY_GOLD_DEPOSIT = 50000.0
+MONTHLY_GOLD_DEPOSIT = 1500.0
 
 # Strategy start date
-STRATEGY_START_DATE = "2016-01-01"
+STRATEGY_START_DATE = "2011-12-01"
 
 # Data loading start date (historical data)
-HISTORICAL_START_DATE = "2014-01-01"
+HISTORICAL_START_DATE = "2009-01-01"
 
 # List of tickers to process
-#TICKERS = [
-#    "NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
-#    "ASML", "GOOG", "META", "AVGO", "AAPL"
-#]
-
 TICKERS = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
-    "ADANIGREEN.NS", "TATAPOWER.NS", "POLYCAB.NS", "DMART.NS", "TATAELXSI.NS"
+    "NVDA", "MSFT", "PLTR", "TSLA", "AMZN",
+    "ASML", "GOOG", "META", "AVGO", "AAPL"
 ]
 
-
-# B1 ladder thresholds (from ATH)
-B1_THRESHOLDS = [0.15, 0.20, 0.25]
-
-# B1 base amounts based on drawdown
-B1_BASE_AMOUNTS = {0.25: 100000, 0.20: 50000, 0.15: 25000}
-
-# Maximum normal investment cap per ticker
-MAX_NORM_CAP = 200000.0
+#TICKERS = [
+#    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
+#    "ADANIGREEN.NS", "TATAPOWER.NS", "POLYCAB.NS", "DMART.NS", "TATAELXSI.NS"
+#]
 
 # Take-profit fraction per phase
 TP_FRAC = 0.15
 
-# Heavy buy base amount
-HEAVY_BASE = 250000.0
-
-# Maximum heavy buys per ATH cycle
-MAX_HEAVY_PER_CYCLE = 3
-
-# Low-marker conditions
-LOW_MARKER_DRAWDOWN_THRESH = 0.30
-LOW_MARKER_EMA_MULT = 0.85
-LOW_MARKER_VOL_MULT = 1.3
-LOW_MARKER_ATR_MULT = 1.3
-LOW_MARKER_CLV_THRESH = 0.40
-LOW_MARKER_RSI_THRESH = 40
-
-# Trend filter thresholds
-TREND_FILTER_DEEP_CRASH = 0.40
-TREND_FILTER_DIP_25 = 0.25
-TREND_FILTER_DIP_15_TO_20 = 0.15
-TREND_FILTER_EMA_EXTENDED = 1.30
-
-# TP multipliers
-TP1_MULT = 1.20
-TP2_MULT = 1.40
-TP3_MULT = 1.60
-
-# Technical indicators periods
+# Technical indicator windows
 RSI_PERIOD = 14
-EMA_PERIOD = 200
 VOL_PERIOD = 60
 ATR_PERIOD = 60
+
+# Checkpoint settings
+CHECKPOINT_FILE = "strategy_checkpoint.pkl"
+ENABLE_CHECKPOINTING = True
+RESUME_FROM_CHECKPOINT = True
+
+# Parameter sets
+DEFAULT_PARAMETERS = {
+    "name": "US",
+    "B1_THRESHOLDS": [0.15, 0.20, 0.25],
+    "B1_BASE_AMOUNTS": {0.15: 500, 0.20: 750, 0.25: 1000},
+    "MAX_NORM_CAP": 2250.0,
+    "HEAVY_BASE": 2000.0,
+    "MAX_HEAVY_PER_CYCLE": 3,
+    "LOW_MARKER_DRAWDOWN_THRESH": 0.30,
+    "LOW_MARKER_EMA_MULT": 0.85,
+    "LOW_MARKER_VOL_MULT": 1.30,
+    "LOW_MARKER_ATR_MULT": 1.30,
+    "LOW_MARKER_CLV_THRESH": 0.40,
+    "LOW_MARKER_RSI_THRESH": 40,
+    "TREND_FILTER_DEEP_CRASH": 0.40,
+    "TREND_FILTER_DIP_25": 0.25,
+    "TREND_FILTER_DIP_15_TO_20": 0.15,
+    "TREND_FILTER_EMA_EXTENDED": 1.30,
+    "TP1_MULT": 1.20,
+    "TP2_MULT": 1.40,
+    "TP3_MULT": 1.60,
+    "EMA_PERIOD": 200
+}
+
+INDIA_PARAMETERS = {
+    "name": "INDIA",
+    "B1_THRESHOLDS": [0.05, 0.075, 0.10],
+    "B1_BASE_AMOUNTS": {0.05: 25000, 0.075: 50000, 0.10: 75000},
+    "MAX_NORM_CAP": 100000.0,
+    "HEAVY_BASE": 150000.0,
+    "MAX_HEAVY_PER_CYCLE": 3,
+    "LOW_MARKER_DRAWDOWN_THRESH": 0.15,
+    "LOW_MARKER_EMA_MULT": 0.93,
+    "LOW_MARKER_VOL_MULT": 1.15,
+    "LOW_MARKER_ATR_MULT": 1.15,
+    "LOW_MARKER_CLV_THRESH": 0.35,
+    "LOW_MARKER_RSI_THRESH": 45,
+    "TREND_FILTER_DEEP_CRASH": 0.25,
+    "TREND_FILTER_DIP_25": 0.20,
+    "TREND_FILTER_DIP_15_TO_20": 0.07,
+    "TREND_FILTER_EMA_EXTENDED": 1.10,
+    "TP1_MULT": 1.12,
+    "TP2_MULT": 1.20,
+    "TP3_MULT": 1.30,
+    "EMA_PERIOD": 150
+}
+
+def resolve_parameters(ticker: str):
+    return DEFAULT_PARAMETERS
+
+
+def select_b1_base_amount(drawdown, thresholds, base_amounts):
+    eligible = [thr for thr in thresholds if drawdown >= thr - 1e-9]
+    if not eligible:
+        return 0.0
+    chosen = max(eligible)
+    if chosen in base_amounts:
+        return base_amounts[chosen]
+    fallback_key = min(base_amounts.keys())
+    return base_amounts[fallback_key]
+
+
+# ---------------------------------------------------------------------------
+# CHECKPOINT HELPERS
+# ---------------------------------------------------------------------------
+
+def load_checkpoint():
+    if not (ENABLE_CHECKPOINTING and RESUME_FROM_CHECKPOINT):
+        return None
+    if not os.path.exists(CHECKPOINT_FILE):
+        return None
+    try:
+        with open(CHECKPOINT_FILE, "rb") as f:
+            return pickle.load(f)
+    except Exception as exc:
+        print(f"{COLOR_RED}[CHECKPOINT]{COLOR_RESET} Failed to load checkpoint: {exc}")
+        return None
+
+
+def save_checkpoint(state):
+    if not ENABLE_CHECKPOINTING:
+        return
+    try:
+        with open(CHECKPOINT_FILE, "wb") as f:
+            pickle.dump(state, f)
+        print(f"{COLOR_GREEN}[CHECKPOINT]{COLOR_RESET} State saved to {CHECKPOINT_FILE}")
+    except Exception as exc:
+        print(f"{COLOR_RED}[CHECKPOINT]{COLOR_RESET} Failed to save checkpoint: {exc}")
+
 
 # Numerical tolerances
 EPSILON_SHARES = 1e-12
 EPSILON_PRINCIPAL = 1e-9
 EPSILON_XIRR = 1e-12
+
 
 
 # ---------------------------------------------------------------------------
@@ -403,12 +465,13 @@ class TPStateMachine:
         return self.phase in ("TP1", "TP2", "TP3")
 
     def required_multiplier(self):
+        params = getattr(getattr(self, "parent", None), "params", {})
         if self.phase == "TP1":
-            return TP1_MULT
+            return params.get("TP1_MULT")
         if self.phase == "TP2":
-            return TP2_MULT
+            return params.get("TP2_MULT")
         if self.phase == "TP3":
-            return TP3_MULT
+            return params.get("TP3_MULT")
         return None
 
 
@@ -420,10 +483,12 @@ class Portfolio:
     - Tracks full trade log
     - Uses TP state machine per ticker
     """
-    def __init__(self, ticker):
+    def __init__(self, ticker, params):
         self.cycles = []
         self.trade_log = []
         self.ticker = ticker
+        self.params = params
+        self.heavy_counts = {}
 
         self.invested = 0.0
         self.profit_booked = 0.0
@@ -663,7 +728,7 @@ def detect_ath_events(close: pd.Series, signals):
 # 7. RUN STRATEGY FOR ONE TICKER
 # ---------------------------------------------------------------------------
 
-def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
+def run_ticker_strategy(ticker, gold_vault, params, start_date=STRATEGY_START_DATE):
     """
     Runs full strategy for a single ticker.
     Includes:
@@ -685,6 +750,25 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
         return None
 
     start_ts = pd.Timestamp(start_date)
+    b1_thresholds = params["B1_THRESHOLDS"]
+    b1_base_amounts = params["B1_BASE_AMOUNTS"]
+    max_norm_cap = params["MAX_NORM_CAP"]
+    heavy_base = params["HEAVY_BASE"]
+    max_heavy_per_cycle = params["MAX_HEAVY_PER_CYCLE"]
+    trend_deep_crash = params["TREND_FILTER_DEEP_CRASH"]
+    trend_dip_25 = params["TREND_FILTER_DIP_25"]
+    trend_dip_mid = params["TREND_FILTER_DIP_15_TO_20"]
+    trend_ema_ext = params["TREND_FILTER_EMA_EXTENDED"]
+    tp1_mult = params["TP1_MULT"]
+    tp2_mult = params["TP2_MULT"]
+    tp3_mult = params["TP3_MULT"]
+    ema_period = params["EMA_PERIOD"]
+    low_marker_drawdown = params["LOW_MARKER_DRAWDOWN_THRESH"]
+    low_marker_ema = params["LOW_MARKER_EMA_MULT"]
+    low_marker_vol = params["LOW_MARKER_VOL_MULT"]
+    low_marker_atr = params["LOW_MARKER_ATR_MULT"]
+    low_marker_clv = params["LOW_MARKER_CLV_THRESH"]
+    low_marker_rsi = params["LOW_MARKER_RSI_THRESH"]
 
     high = ohlcv["High"]
     low = ohlcv["Low"]
@@ -700,8 +784,8 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
             cycle_id += 1
         cycle_by_date[dt] = cycle_id
 
-    # EMA200 (SMA used here exactly like original)
-    ema200 = close.rolling(EMA_PERIOD).mean()
+    # EMA (SMA used here exactly like original)
+    ema200 = close.rolling(ema_period).mean()
     rsi14 = compute_rsi(close)
 
     # LOG ATR ---------------------------------------------
@@ -725,12 +809,12 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
     clv = (close - low) / day_range
 
     # LOW-MARKER CONDITION ----------------------------------
-    condA = drawdown >= LOW_MARKER_DRAWDOWN_THRESH
-    condB = close <= ema200 * LOW_MARKER_EMA_MULT
-    condC = volume >= vol60 * LOW_MARKER_VOL_MULT
-    condD = log_tr >= atr60 * LOW_MARKER_ATR_MULT
-    condE = clv >= LOW_MARKER_CLV_THRESH
-    condF = rsi14 <= LOW_MARKER_RSI_THRESH
+    condA = drawdown >= low_marker_drawdown
+    condB = close <= ema200 * low_marker_ema
+    condC = volume >= vol60 * low_marker_vol
+    condD = log_tr >= atr60 * low_marker_atr
+    condE = clv >= low_marker_clv
+    condF = rsi14 <= low_marker_rsi
 
     low_marker = condA & condB & condC & condD & condE & condF
     marker_dates = [
@@ -741,12 +825,12 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
     # B1 SIGNALS --------------------------------------------
     signals = [
         (d, price, ath_pre)
-        for (d, price, ath_pre) in detect_bottoms_b1(close, B1_THRESHOLDS)
+        for (d, price, ath_pre) in detect_bottoms_b1(close, b1_thresholds)
         if pd.Timestamp(d) >= start_ts
     ]
 
     # PORTFOLIO for this ticker
-    p = Portfolio(ticker)
+    p = Portfolio(ticker, params)
 
     # Filter ATH events
     ath_events = detect_ath_events(close, signals)
@@ -763,12 +847,12 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
         # Trend filter
         dd = (ath_pre - price) / ath_pre
 
-        if dd >= TREND_FILTER_DEEP_CRASH:
+        if dd >= trend_deep_crash:
             trend_ok = True
-        elif dd >= TREND_FILTER_DIP_25:
+        elif dd >= trend_dip_25:
             trend_ok = True
-        elif dd >= TREND_FILTER_DIP_15_TO_20:
-            trend_ok = price <= ema200.loc[date] * TREND_FILTER_EMA_EXTENDED
+        elif dd >= trend_dip_mid:
+            trend_ok = price <= ema200.loc[date] * trend_ema_ext
         else:
             trend_ok = False
 
@@ -776,9 +860,9 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
             continue
 
         # Determine base amount from DD
-        base_amt = B1_BASE_AMOUNTS.get(dd // 0.05 * 0.05, B1_BASE_AMOUNTS[0.15])
+        base_amt = select_b1_base_amount(dd, b1_thresholds, b1_base_amounts)
 
-        executed = p.buy(date, price, base_amt, MAX_NORM_CAP)
+        executed = p.buy(date, price, base_amt, max_norm_cap)
         if executed > 0:
             if ath_pre > last_tp_cycle_ath + 1e-9:
                 tp_cycles.append((date, ath_pre))
@@ -818,7 +902,7 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
         for row in p.trade_log
         if row["type"] == "BUY"
     ]
-    tp_start = min(buy_dates) if buy_dates else pd.Timestamp(STRATEGY_START_DATE)
+    tp_start = min(buy_dates) if buy_dates else pd.Timestamp(start_date)
 
     future_dates = close[close.index >= tp_start].index
     p.tp.reset()
@@ -844,13 +928,13 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
         # Determine which TP phase to check
         if not p.tp1_done:
             phase = "TP1"
-            multiplier = TP1_MULT
+            multiplier = tp1_mult
         elif not p.tp2_done:
             phase = "TP2"
-            multiplier = TP2_MULT
+            multiplier = tp2_mult
         elif not p.tp3_done:
             phase = "TP3"
-            multiplier = TP3_MULT
+            multiplier = tp3_mult
         else:
             # all TPs done → wait for next ATH
             continue
@@ -881,11 +965,11 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
         price = close.loc[d]
 
         cid = cycle_by_date[d]
-        if heavy_counts.get(cid, 0) >= MAX_HEAVY_PER_CYCLE:
+        if heavy_counts.get(cid, 0) >= max_heavy_per_cycle:
             # already did 3 heavy buys in this ATH cycle
             continue
 
-        executed = p.heavy_buy(d, price, HEAVY_BASE)
+        executed = p.heavy_buy(d, price, heavy_base)
         if executed > 0:
             heavy_counts[cid] = heavy_counts.get(cid, 0) + 1
 
@@ -1160,8 +1244,9 @@ def main():
 
     all_results = []
     for t in TICKERS:
+        params = resolve_parameters(t)
         print(f"{COLOR_CYAN}\nProcessing {t}...{COLOR_RESET}")
-        res = run_ticker_strategy(t, gold_vault, STRATEGY_START_DATE)
+        res = run_ticker_strategy(t, gold_vault, params, STRATEGY_START_DATE)
         if res is None:
             continue
         all_results.append(res)
