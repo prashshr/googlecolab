@@ -45,7 +45,7 @@ COLOR_WHITE = "\033[97m"
 GOLD_TICKER = "GLD"
 
 # Monthly gold deposit amount
-MONTHLY_GOLD_DEPOSIT = 500.0
+MONTHLY_GOLD_DEPOSIT = 1000.0
 
 # Strategy start date
 STRATEGY_START_DATE = "2022-01-01"
@@ -798,7 +798,14 @@ def run_ticker_strategy(ticker, gold_vault, start_date=STRATEGY_START_DATE):
     # TAKE PROFIT PROCESSING - STRICT SEQUENTIAL TP1 → TP2 → TP3
     # -------------------------
 
-    future_dates = close[close.index >= pd.Timestamp(STRATEGY_START_DATE)].index
+    buy_dates = [
+        pd.Timestamp(row["date"])
+        for row in p.trade_log
+        if row["type"] == "BUY"
+    ]
+    tp_start = min(buy_dates) if buy_dates else pd.Timestamp(STRATEGY_START_DATE)
+
+    future_dates = close[close.index >= tp_start].index
     p.tp.reset()
     tp_cycle_idx = -1
 
